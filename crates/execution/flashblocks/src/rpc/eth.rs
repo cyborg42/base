@@ -57,7 +57,7 @@ use alloy_primitives::{
 use alloy_rpc_types::{
     BlockOverrides,
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
-    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+    state::{AccountOverride, EvmOverrides, StateOverride},
 };
 use alloy_rpc_types_eth::{Filter, Log};
 use base_common_evm::BaseTransaction as BaseRevm;
@@ -86,6 +86,47 @@ use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
+
+fn merge_state_overrides(mut pending: StateOverride, user: StateOverride) -> StateOverride {
+    for (address, user_account) in user {
+        let Some(pending_account) = pending.get_mut(&address) else {
+            pending.insert(address, user_account);
+            continue;
+        };
+        let AccountOverride { balance, nonce, code, state, state_diff, move_precompile_to } =
+            user_account;
+
+        if balance.is_some() {
+            pending_account.balance = balance;
+        }
+        if nonce.is_some() {
+            pending_account.nonce = nonce;
+        }
+        if code.is_some() {
+            pending_account.code = code;
+        }
+        if move_precompile_to.is_some() {
+            pending_account.move_precompile_to = move_precompile_to;
+        }
+
+        match (state, state_diff) {
+            (Some(state), state_diff) => {
+                pending_account.state = Some(state);
+                pending_account.state_diff = state_diff;
+            }
+            (None, Some(state_diff)) => {
+                if let Some(state) = pending_account.state.as_mut() {
+                    state.extend(state_diff);
+                } else {
+                    pending_account.state_diff.get_or_insert_default().extend(state_diff);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    pending
+}
 
 /// Eth API override trait for flashblocks integration.
 #[cfg_attr(not(test), rpc(server, namespace = "eth"))]
@@ -443,11 +484,10 @@ where
         }
 
         // Apply user's overrides on top
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder =
-            state_overrides_builder.extend(state_overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
+        let final_overrides = merge_state_overrides(
+            pending_overrides.state.unwrap_or_default(),
+            state_overrides.unwrap_or_default(),
+        );
 
         // Delegate to the underlying eth_api
         EthCall::call(
@@ -483,10 +523,10 @@ where
             pending_overrides.state = pending_blocks.get_state_overrides();
         }
 
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder = state_overrides_builder.extend(overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
+        let final_overrides = merge_state_overrides(
+            pending_overrides.state.unwrap_or_default(),
+            overrides.unwrap_or_default(),
+        );
 
         // EIP-8130 request: estimate via a single read-only simulation against
         // the (pending-merged) block state, gated on the Cobalt fork. The
@@ -537,11 +577,10 @@ where
         // Prepend flashblocks pending overrides to the block state calls
         let mut block_state_calls: Vec<SimBlock<BaseTransactionRequest>> = Vec::new();
         for sim_block in opts.block_state_calls {
-            let mut state_overrides_builder =
-                StateOverridesBuilder::new(pending_overrides.state.clone().unwrap_or_default());
-            state_overrides_builder =
-                state_overrides_builder.extend(sim_block.state_overrides.unwrap_or_default());
-            let final_overrides = state_overrides_builder.build();
+            let final_overrides = merge_state_overrides(
+                pending_overrides.state.clone().unwrap_or_default(),
+                sim_block.state_overrides.unwrap_or_default(),
+            );
 
             let block_state_call = SimBlock { state_overrides: Some(final_overrides), ..sim_block };
             block_state_calls.push(block_state_call);
@@ -693,5 +732,132 @@ where
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256, U256};
+    use alloy_rpc_types::state::{AccountOverride, StateOverride};
+
+    use super::merge_state_overrides;
+
+    #[test]
+    fn merge_state_overrides_preserves_pending_slots_for_same_account() {
+        let account = Address::repeat_byte(0x11);
+        let pending_slot = B256::repeat_byte(0x22);
+        let pending_value = B256::repeat_byte(0x33);
+        let user_slot = B256::repeat_byte(0x44);
+        let user_value = B256::repeat_byte(0x55);
+        let pending = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                state_diff: Some([(pending_slot, pending_value)].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+        let user = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                state_diff: Some([(user_slot, user_value)].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+
+        let merged = merge_state_overrides(pending, user);
+        let state_diff = merged
+            .get(&account)
+            .and_then(|account| account.state_diff.as_ref())
+            .expect("merged account should contain a state diff");
+
+        assert_eq!(state_diff.get(&pending_slot), Some(&pending_value));
+        assert_eq!(state_diff.get(&user_slot), Some(&user_value));
+    }
+
+    #[test]
+    fn merge_state_overrides_applies_user_values_on_top() {
+        let account = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let pending = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                balance: Some(U256::from(1)),
+                nonce: Some(2),
+                state_diff: Some([(slot, B256::repeat_byte(0x33))].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+        let user = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                balance: Some(U256::from(3)),
+                state_diff: Some([(slot, B256::repeat_byte(0x44))].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+
+        let merged = merge_state_overrides(pending, user);
+        let account = merged.get(&account).expect("merged account should exist");
+
+        assert_eq!(account.balance, Some(U256::from(3)));
+        assert_eq!(account.nonce, Some(2));
+        assert_eq!(
+            account.state_diff.as_ref().and_then(|state| state.get(&slot)),
+            Some(&B256::repeat_byte(0x44))
+        );
+    }
+
+    #[test]
+    fn merge_state_overrides_user_state_replaces_pending_storage() {
+        let account = Address::repeat_byte(0x11);
+        let pending = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                state_diff: Some(
+                    [(B256::repeat_byte(0x22), B256::repeat_byte(0x33))].into_iter().collect(),
+                ),
+                ..Default::default()
+            },
+        )]);
+        let user_state = [(B256::repeat_byte(0x44), B256::repeat_byte(0x55))].into_iter().collect();
+        let user = StateOverride::from_iter([(
+            account,
+            AccountOverride { state: Some(user_state), ..Default::default() },
+        )]);
+
+        let merged = merge_state_overrides(pending, user);
+        let account = merged.get(&account).expect("merged account should exist");
+
+        assert!(account.state.is_some());
+        assert!(account.state_diff.is_none());
+    }
+
+    #[test]
+    fn merge_state_overrides_user_diff_updates_pending_state() {
+        let account = Address::repeat_byte(0x11);
+        let pending_slot = B256::repeat_byte(0x22);
+        let user_slot = B256::repeat_byte(0x44);
+        let pending = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                state: Some([(pending_slot, B256::repeat_byte(0x33))].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+        let user = StateOverride::from_iter([(
+            account,
+            AccountOverride {
+                state_diff: Some([(user_slot, B256::repeat_byte(0x55))].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+
+        let merged = merge_state_overrides(pending, user);
+        let account = merged.get(&account).expect("merged account should exist");
+        let state = account.state.as_ref().expect("merged account should retain full state");
+
+        assert_eq!(state.get(&pending_slot), Some(&B256::repeat_byte(0x33)));
+        assert_eq!(state.get(&user_slot), Some(&B256::repeat_byte(0x55)));
+        assert!(account.state_diff.is_none());
     }
 }
