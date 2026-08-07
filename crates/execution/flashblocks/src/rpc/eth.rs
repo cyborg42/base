@@ -193,13 +193,23 @@ impl<Eth: EthApiTypes, FB: FlashblocksAPI> EthApiExt<Eth, FB> {
     /// `MemoryOverlayStateProvider`, and re-applying the whole flashblock diff as state
     /// overrides on every call would be pure overhead.
     ///
+    /// reth is accepted when it is at or ahead of the snapshot we just loaded, not only on an
+    /// exact match. `publish_pending_blocks` writes into reth before the caller swaps the new
+    /// snapshot into `pending_blocks`, so an exact comparison reports a mismatch once per
+    /// flashblock for as long as that gap lasts. Nothing else on this node writes reth's pending
+    /// block, so a higher number simply means a newer flashblock snapshot, which is what a
+    /// `pending` request asks for. That assumption breaks if this node ever builds payloads
+    /// locally.
+    ///
     /// A `false` result is not an error: reth clears its pending block on every canonical
     /// commit, so callers simply fall back to the canonical block plus state overrides.
     fn native_pending_ready(&self, pending_blocks: &Option<Arc<PendingBlocks>>) -> bool {
         let Some(pending) = pending_blocks.as_ref() else {
             return false;
         };
-        self.flashblocks_state.native_pending_block_number() == Some(pending.latest_block_number())
+        self.flashblocks_state
+            .native_pending_block_number()
+            .is_some_and(|published| published >= pending.latest_block_number())
     }
 }
 
