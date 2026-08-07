@@ -438,6 +438,7 @@ mod tests {
         database::InMemoryDB,
         state::{AccountInfo, Bytecode},
     };
+    use revm_database::states::bundle_state::BundleRetention;
 
     use super::*;
 
@@ -457,6 +458,104 @@ mod tests {
             AccountInfo { code: Some(code), code_hash, nonce: 1, ..Default::default() },
         );
         db
+    }
+
+    #[test]
+    fn state_overrides_agree_with_bundle_state() {
+        // The RPC layer used to serve `pending` by replaying `state_overrides` on top of the
+        // canonical block. It is now served by reth's pending overlay, which reads the very same
+        // execution result through `db.bundle_state`. Both views must agree entry for entry,
+        // otherwise the two code paths would return different simulation results.
+        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
+        let mut inner_db = InMemoryDB::default();
+        inner_db.insert_account_info(
+            Address::ZERO,
+            AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                ..Default::default()
+            },
+        );
+        // Production runs on `State<_>`, which is what carries the bundle state the pending
+        // overlay reads; `CacheDB` alone has no bundle state to compare against.
+        let db = State::builder().with_database(inner_db).with_bundle_update().build();
+
+        let header = Header {
+            timestamp: 100,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
+        };
+        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
+        let evm_env = evm_config.evm_env(&header).expect("failed to create evm env");
+        let evm = evm_config.evm_with_env(db, evm_env);
+        let pending_block = Block { header, body: Default::default() };
+
+        let mut builder = PendingStateBuilder::new(
+            (*chain_spec).clone(),
+            evm,
+            pending_block,
+            None,
+            L1BlockInfo::default(),
+            StateOverride::default(),
+        );
+
+        builder.execute_transaction(0, create_legacy_tx()).expect("transaction execution failed");
+
+        let (mut db, state_overrides) = builder.into_db_and_state_overrides();
+        db.merge_transitions(BundleRetention::Reverts);
+        let bundle_state = db.bundle_state.clone();
+
+        assert!(
+            !state_overrides.is_empty(),
+            "executing a transaction should have produced state overrides to compare against"
+        );
+
+        let mut compared_accounts = 0usize;
+        for (address, account_override) in &state_overrides {
+            let account = bundle_state.account(address);
+
+            // Compare observable values, not `Option` presence: an account absent from the
+            // bundle reads as non-existent, i.e. balance and nonce zero.
+            //
+            // Where the two views disagree, the overlay is the accurate one. A state override
+            // can only say "set these fields", never "this account is gone": code is recorded
+            // as None for a selfdestructed account and is therefore left untouched by
+            // apply_account_override, and storage is merged as a diff so untouched slots
+            // survive. The overlay reads the post-execution bundle state and reports the
+            // account as non-existent, which is what actually happened.
+            if let Some(balance) = account_override.balance {
+                let bundle_balance =
+                    account.and_then(|a| a.info.as_ref()).map(|i| i.balance).unwrap_or_default();
+                assert_eq!(
+                    bundle_balance, balance,
+                    "balance mismatch between state override and bundle state for {address}"
+                );
+                compared_accounts += 1;
+            }
+
+            if let Some(nonce) = account_override.nonce {
+                let bundle_nonce =
+                    account.and_then(|a| a.info.as_ref()).map(|i| i.nonce).unwrap_or_default();
+                assert_eq!(
+                    bundle_nonce, nonce,
+                    "nonce mismatch between state override and bundle state for {address}"
+                );
+                compared_accounts += 1;
+            }
+
+            for (slot, value) in account_override.state_diff.iter().flatten() {
+                let bundle_value =
+                    bundle_state.storage(address, U256::from_be_bytes(slot.0)).unwrap_or_default();
+                assert_eq!(
+                    bundle_value,
+                    U256::from_be_bytes(value.0),
+                    "storage mismatch between state override and bundle state at {address}:{slot}"
+                );
+                compared_accounts += 1;
+            }
+        }
+
+        assert!(compared_accounts > 0, "expected at least one field to compare");
     }
 
     #[test]

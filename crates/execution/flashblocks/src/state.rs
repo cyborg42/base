@@ -1,12 +1,13 @@
 //! Flashblocks state management.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use alloy_consensus::Header;
 use arc_swap::{ArcSwapOption, Guard};
 use base_common_chains::Upgrades;
-use base_common_consensus::BaseBlock;
+use base_common_consensus::{BaseBlock, BasePrimitives};
 use base_common_flashblocks::Flashblock;
+use reth_chain_state::CanonicalInMemoryState;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
@@ -32,6 +33,8 @@ pub struct FlashblocksState {
     rx: Arc<Mutex<mpsc::UnboundedReceiver<StateUpdate>>>,
     flashblock_sender: Sender<Arc<PendingBlocks>>,
     max_pending_blocks_depth: u64,
+    /// Set once the node has started; used to observe the pending block we publish into reth.
+    canonical_in_memory_state: OnceLock<CanonicalInMemoryState<BasePrimitives>>,
 }
 
 impl FlashblocksState {
@@ -45,6 +48,7 @@ impl FlashblocksState {
         let (flashblock_sender, _) = broadcast::channel(BUFFER_SIZE);
 
         Self {
+            canonical_in_memory_state: OnceLock::new(),
             pending_blocks,
             queue: tx,
             rx: Arc::new(Mutex::new(rx)),
@@ -57,20 +61,26 @@ impl FlashblocksState {
     ///
     /// This spawns a background task that processes canonical blocks and flashblocks.
     /// Should be called after the node is launched and the provider is available.
-    pub fn start<Client>(&self, client: Client)
-    where
+    pub fn start<Client>(
+        &self,
+        client: Client,
+        canonical_in_memory_state: CanonicalInMemoryState<BasePrimitives>,
+    ) where
         Client: StateProviderFactory
             + ChainSpecProvider<ChainSpec: EthChainSpec<Header = Header> + Upgrades>
             + BlockReaderIdExt<Header = Header>
             + Clone
             + 'static,
     {
+        let _ = self.canonical_in_memory_state.set(canonical_in_memory_state.clone());
+
         let state_processor = StateProcessor::new(
             client,
             Arc::clone(&self.pending_blocks),
             self.max_pending_blocks_depth,
             Arc::clone(&self.rx),
             self.flashblock_sender.clone(),
+            canonical_in_memory_state,
         );
 
         tokio::spawn(async move {
@@ -123,6 +133,13 @@ impl FlashblocksAPI for FlashblocksState {
 
     fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>> {
         self.flashblock_sender.subscribe()
+    }
+
+    fn native_pending_block_number(&self) -> Option<u64> {
+        self.canonical_in_memory_state
+            .get()?
+            .pending_block_num_hash()
+            .map(|num_hash| num_hash.number)
     }
 }
 

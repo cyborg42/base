@@ -82,7 +82,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
+use crate::{FlashblocksAPI, PendingBlocks, PendingBlocksAPI, metrics::Metrics};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
@@ -182,6 +182,24 @@ impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
     /// Creates a new extended Eth API instance with flashblocks support.
     pub const fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
         Self { eth_api, eth_filter, flashblocks_state }
+    }
+}
+
+impl<Eth: EthApiTypes, FB: FlashblocksAPI> EthApiExt<Eth, FB> {
+    /// Whether a `pending` simulation can be served by reth's own pending state.
+    ///
+    /// True only when reth's in-memory pending block is the one we published for the current
+    /// flashblock snapshot. In that case `BlockId::pending()` already resolves through reth's
+    /// `MemoryOverlayStateProvider`, and re-applying the whole flashblock diff as state
+    /// overrides on every call would be pure overhead.
+    ///
+    /// A `false` result is not an error: reth clears its pending block on every canonical
+    /// commit, so callers simply fall back to the canonical block plus state overrides.
+    fn native_pending_ready(&self, pending_blocks: &Option<Arc<PendingBlocks>>) -> bool {
+        let Some(pending) = pending_blocks.as_ref() else {
+            return false;
+        };
+        self.flashblocks_state.native_pending_block_number() == Some(pending.latest_block_number())
     }
 }
 
@@ -438,8 +456,13 @@ where
         if block_id.is_pending() {
             Metrics::rpc_call().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
+            if self.native_pending_ready(&pending_blocks) {
+                Metrics::rpc_native_pending_hit().increment(1);
+            } else {
+                Metrics::rpc_native_pending_miss().increment(1);
+                block_id = pending_blocks.get_canonical_block_number().into();
+                pending_overrides.state = pending_blocks.get_state_overrides();
+            }
         }
 
         // Apply user's overrides on top
@@ -479,8 +502,13 @@ where
         if block_id.is_pending() {
             Metrics::rpc_estimate_gas().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
+            if self.native_pending_ready(&pending_blocks) {
+                Metrics::rpc_native_pending_hit().increment(1);
+            } else {
+                Metrics::rpc_native_pending_miss().increment(1);
+                block_id = pending_blocks.get_canonical_block_number().into();
+                pending_overrides.state = pending_blocks.get_state_overrides();
+            }
         }
 
         let mut state_overrides_builder =
@@ -530,8 +558,13 @@ where
         if block_id.is_pending() {
             Metrics::rpc_simulate_v1().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
+            if self.native_pending_ready(&pending_blocks) {
+                Metrics::rpc_native_pending_hit().increment(1);
+            } else {
+                Metrics::rpc_native_pending_miss().increment(1);
+                block_id = pending_blocks.get_canonical_block_number().into();
+                pending_overrides.state = pending_blocks.get_state_overrides();
+            }
         }
 
         // Prepend flashblocks pending overrides to the block state calls

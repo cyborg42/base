@@ -150,6 +150,20 @@ pub enum StateProcessorError {
     /// Missing first flashblock, so this one can't be processed.
     #[error("missing first flashblock: cannot build pending blocks without first flashblock")]
     MissingFirstFlashblock,
+
+    /// A pending transaction has no recorded sender, so the block cannot be recovered.
+    #[error("missing sender for pending transaction {tx_hash}")]
+    MissingPendingSender {
+        /// Hash of the transaction whose sender is missing.
+        tx_hash: alloy_primitives::B256,
+    },
+
+    /// A pending transaction has no recorded receipt.
+    #[error("missing receipt for pending transaction {tx_hash}")]
+    MissingPendingReceipt {
+        /// Hash of the transaction whose receipt is missing.
+        tx_hash: alloy_primitives::B256,
+    },
 }
 
 impl From<RecoveryError> for StateProcessorError {

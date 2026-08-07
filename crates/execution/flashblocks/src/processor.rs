@@ -16,15 +16,18 @@ use alloy_primitives::{Address, BlockNumber};
 use alloy_rpc_types_eth::state::StateOverride;
 use arc_swap::ArcSwapOption;
 use base_common_chains::Upgrades;
-use base_common_consensus::{BaseBlock, BaseTxEnvelope};
+use base_common_consensus::{BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope};
 use base_common_flashblocks::Flashblock;
 use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
 use rayon::prelude::*;
+use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::ConfigureEvm;
+use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{BlockReaderIdExt, StateProviderBox, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
+use reth_trie::ComputedTrieData;
 use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
@@ -66,6 +69,7 @@ pub struct StateProcessor<Client> {
     sender: Sender<Arc<PendingBlocks>>,
     cache: Arc<Mutex<FlashblockCache>>,
     live_state: StdMutex<Option<LivePendingState>>,
+    canonical_in_memory_state: CanonicalInMemoryState<BasePrimitives>,
 }
 
 impl<Client> StateProcessor<Client>
@@ -99,9 +103,41 @@ where
         pending_blocks_builder.with_state_overrides(state_overrides.clone());
 
         let pending_blocks = Arc::new(pending_blocks_builder.build()?);
+        self.publish_native_pending_block(&pending_blocks);
         self.set_live_state(db, state_overrides);
 
         Ok(Some(pending_blocks))
+    }
+
+    /// Publishes the latest pending block into reth's `CanonicalInMemoryState`.
+    ///
+    /// This is what makes `BlockId::pending()` resolve to reth's own
+    /// `MemoryOverlayStateProvider` instead of forcing every `eth_call` to replay the whole
+    /// flashblock diff as RPC state overrides.
+    ///
+    /// Trie data is published empty on purpose: `eth_call` never reads it, and computing it is
+    /// the expensive path flashblocks deliberately avoids.
+    fn publish_native_pending_block(&self, pending_blocks: &PendingBlocks) {
+        let started_at = Instant::now();
+        match build_executed_block(pending_blocks) {
+            Ok(executed) => {
+                let transactions = executed.recovered_block().body().transactions.len();
+                self.canonical_in_memory_state.set_pending_block(executed);
+                Metrics::native_pending_block_published().increment(1);
+                Metrics::native_pending_block_duration().record(started_at.elapsed());
+                Metrics::native_pending_block_height()
+                    .set(pending_blocks.latest_block_number() as f64);
+                Metrics::native_pending_block_transactions().set(transactions as f64);
+            }
+            Err(error) => {
+                Metrics::native_pending_block_error().increment(1);
+                warn!(
+                    message = "could not publish native pending block",
+                    block_number = pending_blocks.latest_block_number(),
+                    %error,
+                );
+            }
+        }
     }
 
     /// Creates a new state processor wired to the provided channels and state.
@@ -111,6 +147,7 @@ where
         max_depth: u64,
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
         sender: Sender<Arc<PendingBlocks>>,
+        canonical_in_memory_state: CanonicalInMemoryState<BasePrimitives>,
     ) -> Self {
         let cache = client
             .best_block_number()
@@ -124,6 +161,7 @@ where
             sender,
             cache: Arc::new(Mutex::new(cache)),
             live_state: StdMutex::new(None),
+            canonical_in_memory_state,
         }
     }
 
@@ -844,4 +882,48 @@ where
 
         self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
     }
+}
+
+/// Assembles the reth-native [`ExecutedBlock`] for the latest pending block.
+///
+/// All inputs are already materialised by flashblock execution: transactions and their senders
+/// (no signature recovery), consensus receipts, and the merged bundle state.
+fn build_executed_block(pending: &PendingBlocks) -> Result<ExecutedBlock<BasePrimitives>> {
+    let flashblocks = pending.latest_block_flashblocks();
+    let AssembledBlock { block, .. } = BlockAssembler::assemble(&flashblocks)?;
+
+    let mut senders = Vec::with_capacity(block.body.transactions.len());
+    let mut receipts = Vec::with_capacity(block.body.transactions.len());
+    for transaction in &block.body.transactions {
+        let tx_hash = transaction.tx_hash();
+        let sender = pending
+            .get_transaction_sender(&tx_hash)
+            .ok_or(StateProcessorError::MissingPendingSender { tx_hash })?;
+        let receipt = pending
+            .get_receipt(tx_hash)
+            .ok_or(StateProcessorError::MissingPendingReceipt { tx_hash })?;
+        senders.push(sender);
+        receipts.push(consensus_receipt(receipt));
+    }
+
+    let execution_output = BlockExecutionOutput {
+        result: BlockExecutionResult {
+            receipts,
+            requests: Default::default(),
+            gas_used: pending.latest_block_cumulative_gas_used(),
+            blob_gas_used: 0,
+        },
+        state: (*pending.get_bundle_state()).clone(),
+    };
+
+    Ok(ExecutedBlock::new(
+        Arc::new(RecoveredBlock::new_unhashed(block, senders)),
+        Arc::new(execution_output),
+        ComputedTrieData::default(),
+    ))
+}
+
+/// Converts the stored RPC receipt back into its consensus form.
+fn consensus_receipt(receipt: &base_common_rpc_types::BaseTransactionReceipt) -> BaseReceipt {
+    receipt.inner.inner.receipt.clone().map_logs(|log| log.inner)
 }

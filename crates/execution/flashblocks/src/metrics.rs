@@ -36,6 +36,20 @@ base_metrics::define_metrics! {
     rpc_get_balance: counter,
     #[describe("Count of times flashblocks get_block_by_number is called")]
     rpc_get_block_by_number: counter,
+    #[describe("Count of times the native pending block could not be published")]
+    native_pending_block_error: counter,
+    #[describe("Count of native pending blocks published into reth in-memory state")]
+    native_pending_block_published: counter,
+    #[describe("Time taken to assemble and publish the native pending block")]
+    native_pending_block_duration: histogram,
+    #[describe("Block number of the last native pending block published (current)")]
+    native_pending_block_height: gauge,
+    #[describe("Transactions in the last native pending block published (current)")]
+    native_pending_block_transactions: gauge,
+    #[describe("Count of pending simulations served by reth's native pending state")]
+    rpc_native_pending_hit: counter,
+    #[describe("Count of pending simulations that fell back to canonical block + state overrides")]
+    rpc_native_pending_miss: counter,
     #[describe("Count of times flashblocks call is called")]
     rpc_call: counter,
     #[describe("Count of times flashblocks estimate_gas is called")]

@@ -27,6 +27,12 @@ pub trait FlashblocksAPI {
 
     /// Subscribes to flashblock updates.
     fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>>;
+
+    /// Number of the pending block currently published into reth's in-memory state.
+    ///
+    /// `None` means `BlockId::pending()` will not resolve to flashblock state, so callers must
+    /// fall back to simulating on the canonical block with flashblock state overrides.
+    fn native_pending_block_number(&self) -> Option<u64>;
 }
 
 /// API for accessing pending blocks data.

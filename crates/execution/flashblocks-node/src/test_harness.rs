@@ -144,7 +144,7 @@ impl BaseNodeExtension for FlashblocksTestExtension {
             let provider = ctx.provider().clone();
 
             // Start the state processor with the provider
-            state_for_start.start(provider.clone());
+            state_for_start.start(provider.clone(), provider.canonical_in_memory_state());
 
             // Spawn a task to forward canonical state notifications to the in-memory state
             let provider_for_notify = provider;
