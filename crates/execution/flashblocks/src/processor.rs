@@ -118,6 +118,24 @@ where
     /// Trie data is published empty on purpose: `eth_call` never reads it, and computing it is
     /// the expensive path flashblocks deliberately avoids.
     fn publish_native_pending_block(&self, pending_blocks: &PendingBlocks) {
+        // reth resolves pending state through `history_by_block_hash` on the anchor, which for a
+        // block whose parent it does not hold is that parent itself. Publishing a block that sits
+        // more than one above the canonical head therefore makes every pending query fail with
+        // "block not found: hash" instead of falling back, because the parent has not been sealed
+        // yet. Leaving reth's pending slot empty in that case restores the pre-overlay behaviour:
+        // `native_pending_ready` reports false and callers use the canonical block plus overrides.
+        let canonical_head = self.canonical_in_memory_state.get_canonical_head().number;
+        let pending_number = pending_blocks.latest_block_number();
+        if pending_number != canonical_head + 1 {
+            Metrics::native_pending_block_skipped_ahead().increment(1);
+            debug!(
+                message =
+                    "pending block is not the canonical head's child, skipping native publish",
+                pending_number, canonical_head,
+            );
+            return;
+        }
+
         let started_at = Instant::now();
         match build_executed_block(pending_blocks) {
             Ok(executed) => {
