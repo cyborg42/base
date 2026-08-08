@@ -56,6 +56,16 @@ base_metrics::define_metrics! {
     rpc_native_pending_hit: counter,
     #[describe("Count of pending simulations that fell back to canonical block + state overrides")]
     rpc_native_pending_miss: counter,
+    #[describe(
+        "Fallbacks taken because no pending snapshot exists; pending equals latest, so the fallback is the correct answer"
+    )]
+    rpc_native_pending_miss_no_state: counter,
+    #[describe(
+        "Fallbacks taken because reth's pending slot does not hold our snapshot yet; reth clears it on every canonical commit"
+    )]
+    rpc_native_pending_miss_reth_behind: counter,
+    #[describe("Count of pending simulations that returned an error to the caller")]
+    rpc_pending_error: counter,
     #[describe("Count of times flashblocks call is called")]
     rpc_call: counter,
     #[describe("Count of times flashblocks estimate_gas is called")]
