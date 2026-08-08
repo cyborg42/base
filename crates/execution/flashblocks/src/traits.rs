@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, TxHash, U256};
-use alloy_rpc_types_eth::{Filter, Log, state::StateOverride};
+use alloy_rpc_types_eth::{Filter, Log};
 use arc_swap::Guard;
 use base_common_flashblocks::Flashblock;
 use base_common_network::Base;
@@ -54,9 +54,6 @@ pub trait PendingBlocksAPI {
 
     /// Gets balance for an address. Returns None if address not updated in flashblocks.
     fn get_balance(&self, address: Address) -> Option<U256>;
-
-    /// Gets the state overrides for the pending blocks
-    fn get_state_overrides(&self) -> Option<StateOverride>;
 
     /// Gets logs from pending state matching the provided filter.
     fn get_pending_logs(&self, filter: &Filter) -> Vec<Log>;

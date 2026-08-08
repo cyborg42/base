@@ -4,7 +4,7 @@ use alloy_consensus::{Header, Sealed, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, BlockNumber, TxHash, U256};
 use alloy_provider::network::TransactionResponse;
-use alloy_rpc_types::{BlockTransactions, Withdrawal, state::StateOverride};
+use alloy_rpc_types::{BlockTransactions, Withdrawal};
 use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::{Filter, Header as RPCHeader, Log};
 use arc_swap::Guard;
@@ -47,7 +47,6 @@ pub struct PendingBlocksBuilder {
     next_position_per_block: StdHashMap<BlockNumber, usize>,
     transaction_state: HashMap<B256, EvmState>,
     transaction_senders: HashMap<B256, Address>,
-    state_overrides: Option<StateOverride>,
     transaction_results: HashMap<B256, ExecutionResult<BaseHaltReason>>,
     execution_times: HashMap<B256, u128>,
 
@@ -86,7 +85,6 @@ impl PendingBlocksBuilder {
             transaction_senders: HashMap::new(),
             transaction_results: HashMap::new(),
             execution_times: HashMap::new(),
-            state_overrides: None,
             bundle_state: None,
             deferred_error: None,
         }
@@ -110,8 +108,6 @@ impl PendingBlocksBuilder {
         let next_position_per_block = pending_blocks.next_position_per_block.clone();
         let bundle_state = Arc::clone(&pending_blocks.bundle_state);
 
-        let state_overrides = pending_blocks.state_overrides.clone();
-
         Self {
             flashblocks,
             headers,
@@ -130,7 +126,6 @@ impl PendingBlocksBuilder {
             next_position_per_block,
             transaction_state,
             transaction_senders,
-            state_overrides,
             transaction_results,
             execution_times,
             bundle_state: Some(bundle_state),
@@ -240,13 +235,6 @@ impl PendingBlocksBuilder {
     #[inline]
     pub fn with_account_balance(&mut self, address: Address, balance: U256) -> &Self {
         self.account_balances.insert(address, balance);
-        self
-    }
-
-    /// Sets state overrides for the pending blocks.
-    #[inline]
-    pub fn with_state_overrides(&mut self, state_overrides: StateOverride) -> &Self {
-        self.state_overrides = Some(state_overrides);
         self
     }
 
@@ -360,7 +348,6 @@ impl PendingBlocksBuilder {
             next_position_per_block: self.next_position_per_block,
             transaction_state: self.transaction_state,
             transaction_senders: self.transaction_senders,
-            state_overrides: self.state_overrides,
             bundle_state: self.bundle_state.unwrap_or_default(),
             transaction_results: self.transaction_results,
             execution_times: self.execution_times,
@@ -391,7 +378,6 @@ pub struct PendingBlocks {
     next_position_per_block: StdHashMap<BlockNumber, usize>,
     transaction_state: HashMap<B256, EvmState>,
     transaction_senders: HashMap<B256, Address>,
-    state_overrides: Option<StateOverride>,
     transaction_results: HashMap<B256, ExecutionResult<BaseHaltReason>>,
     execution_times: HashMap<B256, u128>,
 
@@ -645,11 +631,6 @@ impl PendingBlocks {
         self.account_balances.get(&address).copied()
     }
 
-    /// Returns the state overrides for the pending state.
-    pub fn get_state_overrides(&self) -> Option<StateOverride> {
-        self.state_overrides.clone()
-    }
-
     /// Returns logs matching the filter from pending state.
     pub fn get_pending_logs(&self, filter: &Filter) -> Vec<Log> {
         let mut logs = Vec::new();
@@ -810,10 +791,6 @@ impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
 
     fn get_balance(&self, address: Address) -> Option<U256> {
         self.as_ref().and_then(|pb| pb.get_balance(address))
-    }
-
-    fn get_state_overrides(&self) -> Option<StateOverride> {
-        self.as_ref().map(|pb| pb.get_state_overrides()).unwrap_or_default()
     }
 
     fn get_pending_logs(&self, filter: &Filter) -> Vec<Log> {

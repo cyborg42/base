@@ -52,18 +52,6 @@ base_metrics::define_metrics! {
     native_pending_block_height: gauge,
     #[describe("Transactions in the last native pending block published (current)")]
     native_pending_block_transactions: gauge,
-    #[describe("Count of pending simulations served by reth's native pending state")]
-    rpc_native_pending_hit: counter,
-    #[describe("Count of pending simulations that fell back to canonical block + state overrides")]
-    rpc_native_pending_miss: counter,
-    #[describe(
-        "Fallbacks taken because no pending snapshot exists; pending equals latest, so the fallback is the correct answer"
-    )]
-    rpc_native_pending_miss_no_state: counter,
-    #[describe(
-        "Fallbacks taken because reth's pending slot does not hold our snapshot yet; reth clears it on every canonical commit"
-    )]
-    rpc_native_pending_miss_reth_behind: counter,
     #[describe(
         "Count of pending simulations that failed with a JSON-RPC server error; execution reverts are excluded because they are a normal outcome"
     )]

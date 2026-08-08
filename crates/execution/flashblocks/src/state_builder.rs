@@ -11,7 +11,6 @@ use alloy_evm::{
 };
 use alloy_primitives::B256;
 use alloy_rpc_types::TransactionTrait;
-use alloy_rpc_types_eth::state::StateOverride;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BasePrimitives, BaseReceipt, BaseTxEnvelope, Predeploys};
 use base_common_evm::{
@@ -69,7 +68,6 @@ pub struct PendingStateBuilder<E, ChainSpec> {
     chain_spec: ChainSpec,
 
     prev_pending_blocks: Option<Arc<PendingBlocks>>,
-    state_overrides: StateOverride,
 }
 
 impl<E, ChainSpec, DB> PendingStateBuilder<E, ChainSpec>
@@ -86,7 +84,6 @@ where
         pending_block: Block<BaseTxEnvelope, Header>,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         l1_block_info: L1BlockInfo,
-        state_overrides: StateOverride,
     ) -> Self {
         Self {
             pending_block,
@@ -95,15 +92,14 @@ where
             next_log_index: 0,
             prev_pending_blocks,
             l1_block_info,
-            state_overrides,
             chain_spec: chain_spec.clone(),
             receipt_builder: UnifiedReceiptBuilder::new(chain_spec),
         }
     }
 
-    /// Consumes the builder and returns the database and state overrides.
-    pub fn into_db_and_state_overrides(self) -> (DB, StateOverride) {
-        (self.evm.into_db(), self.state_overrides)
+    /// Consumes the builder and returns the database.
+    pub fn into_db(self) -> DB {
+        self.evm.into_db()
     }
 
     /// Returns a mutable reference to the underlying database.
@@ -313,22 +309,6 @@ where
         match transact_result {
             Ok(ResultAndState { state, result }) => {
                 let gas_used = result.tx_gas_used();
-                for (addr, acc) in &state {
-                    let existing_override = self.state_overrides.entry(*addr).or_default();
-                    existing_override.balance = Some(acc.info.balance);
-                    existing_override.nonce = Some(acc.info.nonce);
-                    existing_override.code = acc.info.code.clone().map(|code| code.bytes());
-
-                    let existing =
-                        existing_override.state_diff.get_or_insert_with(Default::default);
-                    let changed_slots = acc
-                        .storage
-                        .iter()
-                        .map(|(&key, slot)| (B256::from(key), B256::from(slot.present_value)));
-
-                    existing.extend(changed_slots);
-                }
-
                 self.cumulative_gas_used = self
                     .cumulative_gas_used
                     .checked_add(gas_used)
@@ -438,7 +418,6 @@ mod tests {
         database::InMemoryDB,
         state::{AccountInfo, Bytecode},
     };
-    use revm_database::states::bundle_state::BundleRetention;
 
     use super::*;
 
@@ -461,104 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn state_overrides_agree_with_bundle_state() {
-        // The RPC layer used to serve `pending` by replaying `state_overrides` on top of the
-        // canonical block. It is now served by reth's pending overlay, which reads the very same
-        // execution result through `db.bundle_state`. Both views must agree entry for entry,
-        // otherwise the two code paths would return different simulation results.
-        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
-        let mut inner_db = InMemoryDB::default();
-        inner_db.insert_account_info(
-            Address::ZERO,
-            AccountInfo {
-                balance: U256::from(1_000_000_000_000_000_000u128),
-                ..Default::default()
-            },
-        );
-        // Production runs on `State<_>`, which is what carries the bundle state the pending
-        // overlay reads; `CacheDB` alone has no bundle state to compare against.
-        let db = State::builder().with_database(inner_db).with_bundle_update().build();
-
-        let header = Header {
-            timestamp: 100,
-            gas_limit: 30_000_000,
-            base_fee_per_gas: Some(1_000_000_000),
-            ..Default::default()
-        };
-        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
-        let evm_env = evm_config.evm_env(&header).expect("failed to create evm env");
-        let evm = evm_config.evm_with_env(db, evm_env);
-        let pending_block = Block { header, body: Default::default() };
-
-        let mut builder = PendingStateBuilder::new(
-            (*chain_spec).clone(),
-            evm,
-            pending_block,
-            None,
-            L1BlockInfo::default(),
-            StateOverride::default(),
-        );
-
-        builder.execute_transaction(0, create_legacy_tx()).expect("transaction execution failed");
-
-        let (mut db, state_overrides) = builder.into_db_and_state_overrides();
-        db.merge_transitions(BundleRetention::Reverts);
-        let bundle_state = db.bundle_state.clone();
-
-        assert!(
-            !state_overrides.is_empty(),
-            "executing a transaction should have produced state overrides to compare against"
-        );
-
-        let mut compared_accounts = 0usize;
-        for (address, account_override) in &state_overrides {
-            let account = bundle_state.account(address);
-
-            // Compare observable values, not `Option` presence: an account absent from the
-            // bundle reads as non-existent, i.e. balance and nonce zero.
-            //
-            // Where the two views disagree, the overlay is the accurate one. A state override
-            // can only say "set these fields", never "this account is gone": code is recorded
-            // as None for a selfdestructed account and is therefore left untouched by
-            // apply_account_override, and storage is merged as a diff so untouched slots
-            // survive. The overlay reads the post-execution bundle state and reports the
-            // account as non-existent, which is what actually happened.
-            if let Some(balance) = account_override.balance {
-                let bundle_balance =
-                    account.and_then(|a| a.info.as_ref()).map(|i| i.balance).unwrap_or_default();
-                assert_eq!(
-                    bundle_balance, balance,
-                    "balance mismatch between state override and bundle state for {address}"
-                );
-                compared_accounts += 1;
-            }
-
-            if let Some(nonce) = account_override.nonce {
-                let bundle_nonce =
-                    account.and_then(|a| a.info.as_ref()).map(|i| i.nonce).unwrap_or_default();
-                assert_eq!(
-                    bundle_nonce, nonce,
-                    "nonce mismatch between state override and bundle state for {address}"
-                );
-                compared_accounts += 1;
-            }
-
-            for (slot, value) in account_override.state_diff.iter().flatten() {
-                let bundle_value =
-                    bundle_state.storage(address, U256::from_be_bytes(slot.0)).unwrap_or_default();
-                assert_eq!(
-                    bundle_value,
-                    U256::from_be_bytes(value.0),
-                    "storage mismatch between state override and bundle state at {address}:{slot}"
-                );
-                compared_accounts += 1;
-            }
-        }
-
-        assert!(compared_accounts > 0, "expected at least one field to compare");
-    }
-
-    #[test]
     fn apply_pre_execution_changes_stores_beacon_root_in_eip4788_contract() {
         let db = make_db_with_beacon_roots_contract();
 
@@ -571,21 +452,15 @@ mod tests {
             header: Header { timestamp: POST_ECOTONE_TIMESTAMP, number: 1, ..Default::default() },
             body: BlockBody::<BaseTxEnvelope>::default(),
         };
-        let mut builder = PendingStateBuilder::new(
-            chain_spec,
-            evm,
-            pending_block,
-            None,
-            L1BlockInfo::default(),
-            Default::default(),
-        );
+        let mut builder =
+            PendingStateBuilder::new(chain_spec, evm, pending_block, None, L1BlockInfo::default());
 
         let parent_beacon_block_root = B256::from([0xab; 32]);
         builder
             .apply_pre_execution_changes(B256::ZERO, Some(parent_beacon_block_root))
             .expect("apply_pre_execution_changes should succeed");
 
-        let (db, _) = builder.into_db_and_state_overrides();
+        let db = builder.into_db();
 
         // EIP-4788 stores parent_beacon_block_root at:
         //   slot = timestamp % HISTORY_BUFFER_LENGTH + HISTORY_BUFFER_LENGTH
@@ -627,20 +502,14 @@ mod tests {
             header: Header { timestamp: pre_ecotone_timestamp, number: 1, ..Default::default() },
             body: BlockBody::<BaseTxEnvelope>::default(),
         };
-        let mut builder = PendingStateBuilder::new(
-            chain_spec,
-            evm,
-            pending_block,
-            None,
-            L1BlockInfo::default(),
-            Default::default(),
-        );
+        let mut builder =
+            PendingStateBuilder::new(chain_spec, evm, pending_block, None, L1BlockInfo::default());
 
         builder
             .apply_pre_execution_changes(B256::ZERO, None)
             .expect("apply_pre_execution_changes should succeed pre-Ecotone with no beacon root");
 
-        let (db, _) = builder.into_db_and_state_overrides();
+        let db = builder.into_db();
 
         // EIP-4788 is inactive pre-Ecotone, so the contract should have no storage writes.
         let beacon_account = db.cache.accounts.get(&BEACON_ROOTS_ADDRESS);
@@ -708,7 +577,6 @@ mod tests {
             pending_block,
             None,
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         let tx = create_legacy_tx();
@@ -763,7 +631,6 @@ mod tests {
             second_pending_block,
             Some(prev_pending_blocks),
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         let cached_result = second_builder
@@ -814,7 +681,6 @@ mod tests {
             pending_block,
             None,
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         let tx = create_legacy_tx();
@@ -857,7 +723,6 @@ mod tests {
             pending_block,
             None,
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         let tx = create_legacy_tx();
@@ -913,7 +778,6 @@ mod tests {
             pending_block,
             None,
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         let deposit_tx = base_common_consensus::TxDeposit {
@@ -984,7 +848,6 @@ mod tests {
             pending_block,
             None,
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         let tx_a = create_legacy_tx();
@@ -993,7 +856,7 @@ mod tests {
             first_builder.execute_transaction(0, tx_a).expect("first execution failed");
 
         // Sanity-check: fresh execution increments the sender nonce from 0 to 1.
-        let (first_db, _) = first_builder.into_db_and_state_overrides();
+        let first_db = first_builder.into_db();
         let sender_nonce_after_tx_a = first_db
             .cache
             .accounts
@@ -1068,7 +931,6 @@ mod tests {
             second_pending_block,
             Some(prev_pending_blocks),
             L1BlockInfo::default(),
-            StateOverride::default(),
         );
 
         second_builder
@@ -1077,7 +939,7 @@ mod tests {
 
         // The EVM database must now show nonce 1 for the sender, proving that
         // execute_with_cached_data committed the state before returning.
-        let (second_db_after, _) = second_builder.into_db_and_state_overrides();
+        let second_db_after = second_builder.into_db();
         let sender_nonce_after_cached_tx_a = second_db_after
             .cache
             .accounts

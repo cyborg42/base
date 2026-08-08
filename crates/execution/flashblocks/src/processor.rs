@@ -13,7 +13,6 @@ use alloy_consensus::{
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_network::TransactionResponse;
 use alloy_primitives::{Address, BlockNumber};
-use alloy_rpc_types_eth::state::StateOverride;
 use arc_swap::ArcSwapOption;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope};
@@ -46,7 +45,6 @@ type PendingExecutionDb = State<StateProviderDatabase<StateProviderBox>>;
 #[derive(Debug)]
 struct LivePendingState {
     db: PendingExecutionDb,
-    state_overrides: StateOverride,
 }
 
 /// Messages consumed by the state processor.
@@ -88,23 +86,21 @@ where
         *self.lock_live_state() = None;
     }
 
-    fn set_live_state(&self, db: PendingExecutionDb, state_overrides: StateOverride) {
-        *self.lock_live_state() = Some(LivePendingState { db, state_overrides });
+    fn set_live_state(&self, db: PendingExecutionDb) {
+        *self.lock_live_state() = Some(LivePendingState { db });
     }
 
     fn publish_pending_blocks(
         &self,
         mut pending_blocks_builder: PendingBlocksBuilder,
         mut db: PendingExecutionDb,
-        state_overrides: StateOverride,
     ) -> Result<Option<Arc<PendingBlocks>>> {
         db.merge_transitions(BundleRetention::Reverts);
         pending_blocks_builder.with_bundle_state(db.bundle_state.clone());
-        pending_blocks_builder.with_state_overrides(state_overrides.clone());
 
         let pending_blocks = Arc::new(pending_blocks_builder.build()?);
         self.publish_native_pending_block(&pending_blocks);
-        self.set_live_state(db, state_overrides);
+        self.set_live_state(db);
 
         Ok(Some(pending_blocks))
     }
@@ -494,7 +490,7 @@ where
         let latest_flashblock_tx_start = prev_pending_blocks.pending_transaction_count();
 
         let mut live_state = self.lock_live_state();
-        let Some(LivePendingState { mut db, state_overrides }) = live_state.take() else {
+        let Some(LivePendingState { mut db }) = live_state.take() else {
             warn!(
                 message = "live pending state unavailable, falling back to full rebuild",
                 block_number = flashblock.metadata.block_number,
@@ -568,7 +564,6 @@ where
             pending_block,
             None,
             latest_block_l1_block_info.clone(),
-            state_overrides,
         );
         pending_state_builder.set_execution_offsets(
             prev_pending_blocks.latest_block_cumulative_gas_used(),
@@ -604,7 +599,7 @@ where
 
         let latest_block_cumulative_gas_used = pending_state_builder.cumulative_gas_used();
         let latest_block_next_log_index = pending_state_builder.next_log_index();
-        let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
+        let db = pending_state_builder.into_db();
         pending_blocks_builder.with_latest_block_context(
             latest_flashblock_tx_start,
             latest_block_base,
@@ -613,7 +608,7 @@ where
             latest_block_cumulative_gas_used,
             latest_block_next_log_index,
         );
-        self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
+        self.publish_pending_blocks(pending_blocks_builder, db)
     }
 
     #[instrument(
@@ -634,7 +629,7 @@ where
         };
 
         let mut live_state = self.lock_live_state();
-        let Some(LivePendingState { mut db, state_overrides }) = live_state.take() else {
+        let Some(LivePendingState { mut db }) = live_state.take() else {
             warn!(
                 message = "live pending state unavailable, falling back to full rebuild",
                 block_number = flashblock.metadata.block_number,
@@ -702,7 +697,6 @@ where
             pending_block,
             None,
             l1_block_info.clone(),
-            state_overrides,
         );
         pending_state_builder
             .apply_pre_execution_changes(base.parent_hash, Some(base.parent_beacon_block_root))?;
@@ -735,7 +729,7 @@ where
 
         let latest_block_cumulative_gas_used = pending_state_builder.cumulative_gas_used();
         let latest_block_next_log_index = pending_state_builder.next_log_index();
-        let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
+        let db = pending_state_builder.into_db();
         pending_blocks_builder.with_latest_block_context(
             prev_pending_blocks.pending_transaction_count(),
             base,
@@ -745,7 +739,7 @@ where
             latest_block_next_log_index,
         );
 
-        self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
+        self.publish_pending_blocks(pending_blocks_builder, db)
     }
 
     #[instrument(level = "debug", skip_all, fields(num_flashblocks = flashblocks.len()))]
@@ -784,11 +778,6 @@ where
         // Track state changes across flashblocks, accumulating bundle state
         // from previous pending blocks if available.
         let mut db = State::builder().with_database(state_provider_db).with_bundle_update().build();
-
-        let mut state_overrides =
-            prev_pending_blocks.as_ref().map_or_else(StateOverride::default, |pending_blocks| {
-                pending_blocks.get_state_overrides().unwrap_or_default()
-            });
 
         let mut total_transaction_count = 0usize;
         for (_block_number, flashblocks) in flashblocks_per_block {
@@ -857,7 +846,6 @@ where
                 assembled.block,
                 prev_pending_blocks.clone(),
                 l1_block_info,
-                state_overrides,
             );
 
             pending_state_builder
@@ -904,11 +892,11 @@ where
             );
             total_transaction_count += latest_block_transaction_count;
 
-            (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
+            db = pending_state_builder.into_db();
             last_block_header = block_header;
         }
 
-        self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
+        self.publish_pending_blocks(pending_blocks_builder, db)
     }
 }
 

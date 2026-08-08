@@ -56,8 +56,8 @@ use alloy_primitives::{
 };
 use alloy_rpc_types::{
     BlockOverrides,
-    simulate::{SimBlock, SimulatePayload, SimulatedBlock},
-    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+    simulate::{SimulatePayload, SimulatedBlock},
+    state::{EvmOverrides, StateOverride},
 };
 use alloy_rpc_types_eth::{Filter, Log};
 use base_common_evm::BaseTransaction as BaseRevm;
@@ -82,7 +82,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use crate::{FlashblocksAPI, PendingBlocks, PendingBlocksAPI, metrics::Metrics};
+use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
@@ -193,46 +193,6 @@ impl<Eth: EthApiTypes, FB: FlashblocksAPI> EthApiExt<Eth, FB> {
     /// `MemoryOverlayStateProvider`, and re-applying the whole flashblock diff as state
     /// overrides on every call would be pure overhead.
     ///
-    /// reth is accepted when it is at or ahead of the snapshot we just loaded, not only on an
-    /// exact match. `publish_pending_blocks` writes into reth before the caller swaps the new
-    /// snapshot into `pending_blocks`, so an exact comparison reports a mismatch once per
-    /// flashblock for as long as that gap lasts. Nothing else on this node writes reth's pending
-    /// block, so a higher number simply means a newer flashblock snapshot, which is what a
-    /// `pending` request asks for. That assumption breaks if this node ever builds payloads
-    /// locally.
-    ///
-    /// A `false` result is not an error: reth clears its pending block on every canonical
-    /// commit, so callers simply fall back to the canonical block plus state overrides.
-    fn native_pending_ready(&self, pending_blocks: &Option<Arc<PendingBlocks>>) -> bool {
-        let Some(pending) = pending_blocks.as_ref() else {
-            return false;
-        };
-        self.flashblocks_state
-            .native_pending_block_number()
-            .is_some_and(|published| published >= pending.latest_block_number())
-    }
-
-    /// Records which route a pending simulation took and returns whether the native path is usable.
-    ///
-    /// The two fallback reasons are not equivalent and a single counter cannot tell them apart.
-    /// Without a snapshot, `pending` is `latest` and falling back is the correct answer rather
-    /// than a degradation. With a snapshot that reth has not published yet, the state overrides
-    /// are doing real work, which is what stops them from simply being deleted.
-    fn record_pending_route(&self, pending_blocks: &Option<Arc<PendingBlocks>>) -> bool {
-        if self.native_pending_ready(pending_blocks) {
-            Metrics::rpc_native_pending_hit().increment(1);
-            return true;
-        }
-
-        Metrics::rpc_native_pending_miss().increment(1);
-        if pending_blocks.is_some() {
-            Metrics::rpc_native_pending_miss_reth_behind().increment(1);
-        } else {
-            Metrics::rpc_native_pending_miss_no_state().increment(1);
-        }
-        false
-    }
-
     /// Counts pending simulations the node failed to serve.
     ///
     /// Every other counter here sits on the publish side and reports that assembly succeeded and a
@@ -489,32 +449,18 @@ where
             block_overrides = ?block_overrides,
         );
 
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
+        let block_id = block_number.unwrap_or_default();
         let pending_request = block_id.is_pending();
-        // If the call is to pending block use cached override (if it exists)
         if pending_request {
             Metrics::rpc_call().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if !self.record_pending_route(&pending_blocks) {
-                block_id = pending_blocks.get_canonical_block_number().into();
-                pending_overrides.state = pending_blocks.get_state_overrides();
-            }
         }
-
-        // Apply user's overrides on top
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder =
-            state_overrides_builder.extend(state_overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
 
         // Delegate to the underlying eth_api
         let result = EthCall::call(
             &self.eth_api,
             transaction,
             Some(block_id),
-            EvmOverrides::new(Some(final_overrides), block_overrides),
+            EvmOverrides::new(state_overrides, block_overrides),
         )
         .await
         .map_err(Into::into);
@@ -535,23 +481,11 @@ where
             overrides = ?overrides,
         );
 
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
-        // If the call is to pending block use cached override (if it exists)
+        let block_id = block_number.unwrap_or_default();
         let pending_request = block_id.is_pending();
         if pending_request {
             Metrics::rpc_estimate_gas().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if !self.record_pending_route(&pending_blocks) {
-                block_id = pending_blocks.get_canonical_block_number().into();
-                pending_overrides.state = pending_blocks.get_state_overrides();
-            }
         }
-
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder = state_overrides_builder.extend(overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
 
         // EIP-8130 request: estimate via a single read-only simulation against
         // the (pending-merged) block state, gated on the Cobalt fork. The
@@ -563,7 +497,7 @@ where
                 &self.eth_api,
                 transaction,
                 block_id,
-                EvmOverrides::new(Some(final_overrides), pending_overrides.block),
+                EvmOverrides::new(overrides, None),
             )
             .await;
             Self::record_pending_result(pending_request, &result);
@@ -574,7 +508,7 @@ where
             &self.eth_api,
             transaction,
             block_id,
-            EvmOverrides::new(Some(final_overrides), pending_overrides.block),
+            EvmOverrides::new(overrides, None),
         )
         .await
         .map_err(Into::into);
@@ -592,37 +526,14 @@ where
             block_number = ?block_number,
         );
 
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
-
-        // If the call is to pending block use cached override (if it exists)
+        let block_id = block_number.unwrap_or_default();
         let pending_request = block_id.is_pending();
         if pending_request {
             Metrics::rpc_simulate_v1().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if !self.record_pending_route(&pending_blocks) {
-                block_id = pending_blocks.get_canonical_block_number().into();
-                pending_overrides.state = pending_blocks.get_state_overrides();
-            }
         }
-
-        // Prepend flashblocks pending overrides to the block state calls
-        let mut block_state_calls: Vec<SimBlock<BaseTransactionRequest>> = Vec::new();
-        for sim_block in opts.block_state_calls {
-            let mut state_overrides_builder =
-                StateOverridesBuilder::new(pending_overrides.state.clone().unwrap_or_default());
-            state_overrides_builder =
-                state_overrides_builder.extend(sim_block.state_overrides.unwrap_or_default());
-            let final_overrides = state_overrides_builder.build();
-
-            let block_state_call = SimBlock { state_overrides: Some(final_overrides), ..sim_block };
-            block_state_calls.push(block_state_call);
-        }
-
-        let payload = SimulatePayload { block_state_calls, ..opts };
 
         let result =
-            EthCall::simulate_v1(&self.eth_api, payload, Some(block_id)).await.map_err(Into::into);
+            EthCall::simulate_v1(&self.eth_api, opts, Some(block_id)).await.map_err(Into::into);
         Self::record_pending_result(pending_request, &result);
         result
     }
