@@ -222,10 +222,19 @@ where
         let start_time = Instant::now();
         match self.process_flashblock(prev_pending_blocks, &flashblock) {
             Ok(new_pending_blocks) => {
-                if let Some(ref pb) = new_pending_blocks {
-                    _ = self.sender.send(Arc::clone(pb));
+                // Install before announcing. A subscriber reacting to the event by issuing
+                // `eth_call(pending)` reads the slot this writes, and the hottest path on this node
+                // is exactly that: subscribe to pending logs, see a competitor's swap, simulate
+                // immediately. Announcing first leaves a window where that call is served the
+                // previous snapshot, without the transaction the client was just told about.
+                //
+                // Nothing else needs ordering here: reth's pending slot and the live execution
+                // state are both written by `publish_pending_blocks` before it returns. Keep it
+                // that way — anything added after the send reopens the window.
+                self.pending_blocks.swap(new_pending_blocks.clone());
+                if let Some(pb) = new_pending_blocks {
+                    _ = self.sender.send(pb);
                 }
-                self.pending_blocks.swap(new_pending_blocks);
                 Metrics::block_processing_duration().record(start_time.elapsed());
             }
             Err(e) => {
