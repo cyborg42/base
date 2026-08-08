@@ -27,10 +27,12 @@ pub use config::{BaseEthConfigApiServer, BaseEthConfigHandler};
 #[cfg(feature = "client")]
 pub use engine::BaseEngineApiClient;
 pub use engine::{BaseEngineApi, BaseEngineApiServer, ENGINE_CAPABILITIES};
+mod pending_state;
 pub use error::{BaseEthApiError, BaseInvalidTransactionError, SequencerClientError};
 pub use eth::{BaseEthApi, BaseEthApiBuilder, BaseReceiptBuilder};
 pub use metrics::{DebugApiExtMetrics, DebugApis, EthApiExtMetrics, SequencerMetrics};
 #[cfg(feature = "client")]
 pub use miner::MinerApiExtClient;
 pub use miner::MinerApiExtServer;
+pub use pending_state::{PendingStateSnapshot, PendingStateSource};
 pub use sequencer::{SequencerClient, SequencerClientInner};

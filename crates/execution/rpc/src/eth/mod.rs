@@ -75,9 +75,23 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> BaseEthApi<N, Rpc> {
         sequencer_client: Option<SequencerClient>,
         min_suggested_priority_fee: U256,
     ) -> Self {
-        let inner =
-            Arc::new(BaseEthApiInner { eth_api, sequencer_client, min_suggested_priority_fee });
+        let inner = Arc::new(BaseEthApiInner {
+            eth_api,
+            sequencer_client,
+            min_suggested_priority_fee,
+            pending_state_source: std::sync::OnceLock::new(),
+        });
         Self { inner }
+    }
+
+    /// Installs the source consulted by `local_pending_state`. Called once during node startup,
+    /// after the component that owns the pending state exists.
+    pub fn set_pending_state_source(&self, source: Arc<dyn crate::PendingStateSource>) {
+        let _ = self.inner.pending_state_source.set(source);
+    }
+
+    pub(crate) fn pending_state_source(&self) -> Option<&Arc<dyn crate::PendingStateSource>> {
+        self.inner.pending_state_source.get()
     }
 
     /// Build a [`BaseEthApi`] using [`BaseEthApiBuilder`].
@@ -276,6 +290,8 @@ pub struct BaseEthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     ///
     /// See also <https://github.com/ethereum-optimism/op-geth/blob/d4e0fe9bb0c2075a9bff269fb975464dd8498f75/eth/gasprice/optimism-gasprice.go#L38-L38>
     min_suggested_priority_fee: U256,
+    /// Set once at startup by whichever component owns pending state; see `local_pending_state`.
+    pending_state_source: std::sync::OnceLock<Arc<dyn crate::PendingStateSource>>,
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for BaseEthApiInner<N, Rpc> {

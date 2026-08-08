@@ -9,7 +9,7 @@ use reth_rpc_eth_types::{
     EthApiError, PendingBlock, block::BlockAndReceipts, builder::config::PendingBlockKind,
     error::FromEthApiError,
 };
-use reth_storage_api::{BlockReaderIdExt, StateProviderBox};
+use reth_storage_api::{BlockReaderIdExt, StateProviderBox, StateProviderFactory};
 
 use crate::{BaseEthApi, BaseEthApiError};
 
@@ -34,12 +34,41 @@ where
         self.inner.eth_api.pending_block_kind()
     }
 
-    /// Returns a [`StateProviderBox`] on a mem-pool built pending block overlaying latest.
+    /// Returns the pending state overlay supplied by the configured source, if any.
+    ///
+    /// This is consulted by `LoadState::state_at_block_id` before the provider, which is what
+    /// keeps pending resolution off reth's parent-chain walk. A pre-confirmation source runs
+    /// ahead of canonical ingestion, so that walk hits blocks the node does not hold yet and
+    /// fails with `block not found: hash`. Anchoring on the block the source computed its diff
+    /// against avoids the chain entirely.
+    ///
+    /// There is no mem-pool built pending block on this stack, so without a source there is
+    /// nothing to return and callers fall back to the provider.
     async fn local_pending_state(&self) -> Result<Option<StateProviderBox>, Self::Error>
     where
         Self: SpawnBlocking,
     {
-        Ok(None)
+        let Some(source) = self.pending_state_source() else {
+            return Ok(None);
+        };
+        let Some(snapshot) = source.snapshot() else {
+            return Ok(None);
+        };
+        // The caller discards this error and falls through to the provider, so without a log the
+        // overlay could stop being used and nothing would say so.
+        let historical = match self.provider().history_by_block_hash(snapshot.anchor_hash()) {
+            Ok(historical) => historical,
+            Err(err) => {
+                tracing::warn!(
+                    target: "rpc::eth",
+                    %err,
+                    anchor = %snapshot.anchor_hash(),
+                    "pending state anchor is not available, falling back to provider"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some(snapshot.overlay(historical)))
     }
 
     /// Returns the locally built pending block

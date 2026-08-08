@@ -43,6 +43,7 @@ impl BaseNodeExtension for FlashblocksExtension {
 
         let state_for_canonical = Arc::clone(&state);
         let state_for_rpc = Arc::clone(&state);
+        let state_for_pending = Arc::clone(&state);
         let state_for_start = state;
 
         // Start state processor, subscriber, and canonical subscription after node is started
@@ -69,6 +70,10 @@ impl BaseNodeExtension for FlashblocksExtension {
         // Extend with RPC modules
         hooks.add_rpc_module(move |ctx| {
             info!(message = "Starting Flashblocks RPC");
+
+            // Makes `BlockId::pending()` resolve through the flashblocks overlay instead of reth's
+            // parent-chain walk, which cannot reach a pending block that runs ahead of canonical.
+            ctx.registry.eth_api().set_pending_state_source(state_for_pending);
 
             let api_ext = EthApiExt::new(
                 ctx.registry.eth_api().clone(),

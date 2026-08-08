@@ -44,8 +44,6 @@ base_metrics::define_metrics! {
     pending_snapshot_earliest_height: gauge,
     #[describe("Count of times the native pending block could not be published")]
     native_pending_block_error: counter,
-    #[describe("Count of native pending publishes skipped because the block runs ahead of the canonical head")]
-    native_pending_block_skipped_ahead: counter,
     #[describe("Count of native pending blocks published into reth in-memory state")]
     native_pending_block_published: counter,
     #[describe("Time taken to assemble and publish the native pending block")]
