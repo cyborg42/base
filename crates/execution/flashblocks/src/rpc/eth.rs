@@ -367,39 +367,22 @@ where
         {
             Eip8130CobaltGate::check(&self.eth_api, block_id)?;
             Metrics::rpc_get_transaction_count().increment(1);
-            let (resolved_block, overrides) = if block_id.is_pending() {
-                let pending_blocks = self.flashblocks_state.get_pending_blocks();
-                (
-                    pending_blocks.get_canonical_block_number().into(),
-                    pending_blocks.get_state_overrides(),
-                )
-            } else {
-                (block_id, None)
-            };
-            return ChannelNonceReader::read(
-                &self.eth_api,
-                address,
-                key,
-                resolved_block,
-                overrides.as_ref(),
-            )
-            .await;
+            // The reader resolves the channel slot through `state_at_block_id`, which serves
+            // `pending` from the flashblocks overlay. Replaying overrides on top of an older
+            // block was the way to make a pending channel nonce visible before that existed.
+            return ChannelNonceReader::read(&self.eth_api, address, key, block_id, None).await;
         }
 
-        // Protocol nonce path. `canon + flashblock_delta` on pending,
-        // standard resolution otherwise.
+        // Protocol nonce path. The nonce the pending flashblocks reached is already in the
+        // overlay that `state_at_block_id` resolves `pending` to, so counting flashblock
+        // transactions on top of an older block's nonce is no longer needed.
+        //
+        // reth also takes the pool's highest consecutive nonce for `pending` and returns whichever
+        // is larger. That is a wider answer than this path used to give: a transaction we
+        // submitted that has not landed in a flashblock yet now advances the count, which is what
+        // a caller asking for the next usable nonce wants.
         if block_id.is_pending() {
             Metrics::rpc_get_transaction_count().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            let canon_block = pending_blocks.get_canonical_block_number();
-            let fb_count = pending_blocks.get_transaction_count(address);
-
-            let canon_count =
-                EthState::transaction_count(&self.eth_api, address, Some(canon_block.into()))
-                    .await
-                    .map_err(Into::into)?;
-
-            return Ok(canon_count + fb_count);
         }
 
         EthState::transaction_count(&self.eth_api, address, block_number).await.map_err(Into::into)
