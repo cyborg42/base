@@ -346,15 +346,26 @@ where
             }
             ReconciliationStrategy::Continue => {
                 debug!(
-                    message = "canonical block behind latest pending block, continuing with existing pending state",
+                    message = "canonical block behind latest pending block, re-anchoring pending state on it",
                     latest_pending_block = pending_blocks.latest_block_number(),
                     earliest_pending_block = pending_blocks.earliest_block_number(),
                     canonical_block = block.number,
                     pending_txns_for_block = ?tracked_txn_hashes.len(),
                     canonical_txns_for_block = ?block_txn_hashes.len(),
                 );
-                // If no reorg, we can continue building on top of the existing pending state
-                // NOTE: We do not retain specific flashblocks here to avoid losing track of our "earliest" pending block number
+                // Re-anchor on the block that just became canonical, the same way HandleReorg and
+                // DepthLimitExceeded do. Keeping already-canonical flashblocks only made every
+                // canonical block replay up to `max_depth` blocks of transactions that reth
+                // already holds, and left the pending snapshot anchored that far back.
+                //
+                // Reorg detection is unaffected: it runs above against the block that just
+                // arrived, and the next canonical block is still retained here. `Continue`
+                // implies `latest > canonical`, so the retained set is never empty.
+                //
+                // Unlike those two branches this passes the previous snapshot through: their
+                // state is suspect and must be recomputed, whereas here it is trusted and
+                // carries the transaction execution cache that keeps the replay off the EVM.
+                flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
                 self.build_pending_state(prev_pending_blocks, &flashblocks)
             }
             ReconciliationStrategy::NoPendingState => {
