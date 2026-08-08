@@ -64,8 +64,10 @@ base_metrics::define_metrics! {
         "Fallbacks taken because reth's pending slot does not hold our snapshot yet; reth clears it on every canonical commit"
     )]
     rpc_native_pending_miss_reth_behind: counter,
-    #[describe("Count of pending simulations that returned an error to the caller")]
-    rpc_pending_error: counter,
+    #[describe(
+        "Count of pending simulations that failed with a JSON-RPC server error; execution reverts are excluded because they are a normal outcome"
+    )]
+    rpc_pending_server_error: counter,
     #[describe("Count of times flashblocks call is called")]
     rpc_call: counter,
     #[describe("Count of times flashblocks estimate_gas is called")]

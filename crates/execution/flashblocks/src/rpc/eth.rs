@@ -233,14 +233,28 @@ impl<Eth: EthApiTypes, FB: FlashblocksAPI> EthApiExt<Eth, FB> {
         false
     }
 
-    /// Counts pending simulations that ended in an error returned to the caller.
+    /// Counts pending simulations the node failed to serve.
     ///
     /// Every other counter here sits on the publish side and reports that assembly succeeded and a
     /// route was chosen. Neither notices reth failing to read the state back, which is how 295
-    /// aborted simulations went unrecorded on 2026-08-07 and 2026-08-08.
-    fn record_pending_result<T, E>(pending_request: bool, result: &Result<T, E>) {
-        if pending_request && result.is_err() {
-            Metrics::rpc_pending_error().increment(1);
+    /// aborted simulations went unrecorded on 2026-08-07 and 2026-08-08; those came back as
+    /// `-32001 block not found`.
+    ///
+    /// Only the JSON-RPC server error range counts. A reverted call is an error to jsonrpsee but a
+    /// normal answer to `eth_call`, and counting it would leave this permanently non-zero, burying
+    /// exactly the bursts it exists to expose.
+    fn record_pending_result<T>(pending_request: bool, result: &RpcResult<T>) {
+        if !pending_request {
+            return;
+        }
+        // JSON-RPC reserves everything at or below this for errors raised by the server rather
+        // than by the call itself. `-32001 block not found` is the one this exists to catch.
+        const SERVER_ERROR_CODE_CEILING: i32 = -32000;
+
+        if let Err(err) = result
+            && err.code() <= SERVER_ERROR_CODE_CEILING
+        {
+            Metrics::rpc_pending_server_error().increment(1);
         }
     }
 }
@@ -519,9 +533,10 @@ where
             Some(block_id),
             EvmOverrides::new(Some(final_overrides), block_overrides),
         )
-        .await;
+        .await
+        .map_err(Into::into);
         Self::record_pending_result(pending_request, &result);
-        result.map_err(Into::into)
+        result
     }
 
     async fn estimate_gas(
@@ -578,9 +593,10 @@ where
             block_id,
             EvmOverrides::new(Some(final_overrides), pending_overrides.block),
         )
-        .await;
+        .await
+        .map_err(Into::into);
         Self::record_pending_result(pending_request, &result);
-        result.map_err(Into::into)
+        result
     }
 
     async fn simulate_v1(
@@ -622,9 +638,10 @@ where
 
         let payload = SimulatePayload { block_state_calls, ..opts };
 
-        let result = EthCall::simulate_v1(&self.eth_api, payload, Some(block_id)).await;
+        let result =
+            EthCall::simulate_v1(&self.eth_api, payload, Some(block_id)).await.map_err(Into::into);
         Self::record_pending_result(pending_request, &result);
-        result.map_err(Into::into)
+        result
     }
 
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
