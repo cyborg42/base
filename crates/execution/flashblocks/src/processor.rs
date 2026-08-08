@@ -172,7 +172,11 @@ where
             match update {
                 StateUpdate::Canonical(block) => {
                     debug!(message = "processing canonical block", block_number = block.number);
-                    match self.process_canonical_block(prev_pending_blocks, &block) {
+                    let canonical_started_at = Instant::now();
+                    let canonical_result =
+                        self.process_canonical_block(prev_pending_blocks, &block);
+                    Metrics::canonical_processing_duration().record(canonical_started_at.elapsed());
+                    match canonical_result {
                         Ok(new_pending_blocks) => {
                             self.pending_blocks.swap(new_pending_blocks);
 
@@ -285,6 +289,8 @@ where
             flashblocks.iter().filter(|fb| fb.metadata.block_number == block.number).count();
         Metrics::flashblocks_in_block().record(num_flashblocks_for_canon as f64);
         Metrics::pending_snapshot_height().set(pending_blocks.latest_block_number() as f64);
+        Metrics::pending_snapshot_earliest_height()
+            .set(pending_blocks.earliest_block_number() as f64);
 
         // Check for reorg by comparing transaction sets
         let tracked_txns = pending_blocks.get_transactions_for_block(block.number);
@@ -736,6 +742,8 @@ where
                 .or_default()
                 .push(flashblock.clone());
         }
+
+        Metrics::full_rebuild_flashblocks().record(flashblocks.len() as f64);
 
         let earliest_block_number = flashblocks_per_block.keys().min().unwrap();
         let canonical_block = earliest_block_number - 1;

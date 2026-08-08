@@ -36,6 +36,12 @@ base_metrics::define_metrics! {
     rpc_get_balance: counter,
     #[describe("Count of times flashblocks get_block_by_number is called")]
     rpc_get_block_by_number: counter,
+    #[describe("Time taken to process a canonical block update")]
+    canonical_processing_duration: histogram,
+    #[describe("Flashblocks replayed by a full pending-state rebuild")]
+    full_rebuild_flashblocks: histogram,
+    #[describe("Earliest block number held by the pending snapshot (current)")]
+    pending_snapshot_earliest_height: gauge,
     #[describe("Count of times the native pending block could not be published")]
     native_pending_block_error: counter,
     #[describe("Count of native pending blocks published into reth in-memory state")]
