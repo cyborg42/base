@@ -35,6 +35,38 @@ pub struct TransactionWithLogs {
     pub logs_bloom: Bloom,
 }
 
+/// One flashblock's worth of logs matching a filter, delivered as a single message.
+///
+/// `pendingLogs` flattens the same logs into one message each, which leaves the client inferring
+/// where one flashblock ends and the next begins. The node already knows, so it says so.
+///
+/// The header fields identify which revision of the pending block the logs came from. They are
+/// read from the same `PendingBlocks` the logs were filtered out of, so they cannot disagree with
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingLogsBundle {
+    /// Number of the pending block these logs belong to.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_number: u64,
+    /// Timestamp of the pending block these logs belong to.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_timestamp: u64,
+    /// Index of the flashblock within the pending block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub flashblock_index: u64,
+    /// Transactions in the pending block up to and including this flashblock.
+    ///
+    /// Monotonic within a block, so a consumer can tell whether the state it is about to simulate
+    /// against has moved past the logs that prompted it.
+    #[serde(with = "alloy_serde::quantity")]
+    pub pending_tx_count: u64,
+    /// Logs from this flashblock matching the subscription filter. Empty is a real answer: the
+    /// flashblock arrived and contained nothing of interest, which is not the same as no
+    /// flashblock arriving.
+    pub logs: Vec<Log>,
+}
+
 /// Extended subscription kind that includes both standard Ethereum subscription types
 /// and flashblocks-specific types.
 ///
@@ -89,6 +121,13 @@ pub enum BaseSubscriptionKind {
     ///   where at least one log matches the filter. All logs are included in the response, not
     ///   just the matching ones.
     NewFlashblockTransactions,
+    /// Pending logs delivered one flashblock at a time.
+    ///
+    /// Same filter semantics as [`Self::PendingLogs`], but each notification carries every
+    /// matching log from one flashblock together with the pending block revision they came from,
+    /// instead of one notification per log. A flashblock with no matching logs still produces a
+    /// notification, so the stream doubles as a liveness signal.
+    PendingLogsBundle,
 }
 
 impl ExtendedSubscriptionKind {
@@ -286,5 +325,98 @@ mod tests {
             format!("0x{}", "11".repeat(256)),
             "logsBloom should remain a required bloom field"
         );
+    }
+
+    fn test_log() -> Log {
+        Log {
+            inner: PrimitiveLog {
+                address: Address::with_last_byte(0xAB),
+                data: LogData::new_unchecked(vec![B256::with_last_byte(0x01)], Bytes::new()),
+            },
+            block_hash: Some(B256::with_last_byte(0x02)),
+            block_number: Some(0x64),
+            block_timestamp: Some(0xC8),
+            transaction_hash: Some(B256::with_last_byte(0x03)),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    fn test_pending_logs_bundle() -> PendingLogsBundle {
+        PendingLogsBundle {
+            block_number: 0x64,
+            block_timestamp: 0xC8,
+            flashblock_index: 7,
+            pending_tx_count: 0x2a,
+            logs: vec![test_log()],
+        }
+    }
+
+    #[test]
+    fn pending_logs_bundle_json_format() {
+        let bundle = test_pending_logs_bundle();
+        let json = serde_json::to_value(&bundle).expect("serialization should succeed");
+        let obj = json.as_object().expect("should be a JSON object");
+
+        assert_eq!(obj["blockNumber"], "0x64", "blockNumber should use quantity encoding");
+        assert_eq!(obj["blockTimestamp"], "0xc8", "blockTimestamp should use quantity encoding");
+        assert_eq!(obj["flashblockIndex"], "0x7", "flashblockIndex should use quantity encoding");
+        assert_eq!(obj["pendingTxCount"], "0x2a", "pendingTxCount should use quantity encoding");
+
+        let logs = obj["logs"].as_array().expect("logs should be an array");
+        assert_eq!(logs.len(), 1);
+    }
+
+    #[test]
+    fn pending_logs_bundle_json_roundtrip() {
+        let original = test_pending_logs_bundle();
+        let json_str = serde_json::to_string(&original).expect("serialization should succeed");
+        let deserialized: PendingLogsBundle =
+            serde_json::from_str(&json_str).expect("deserialization should succeed");
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn pending_logs_bundle_keeps_empty_logs() {
+        // An empty bundle says a flashblock arrived carrying nothing of interest, which a
+        // subscriber cannot otherwise tell apart from the stream having stalled. Dropping the
+        // field, or the message, would take that signal away.
+        let mut bundle = test_pending_logs_bundle();
+        bundle.logs.clear();
+        let json = serde_json::to_value(&bundle).expect("serialization should succeed");
+        let obj = json.as_object().expect("should be a JSON object");
+
+        assert!(obj.contains_key("logs"), "logs key should be present when empty");
+        assert_eq!(obj["logs"].as_array().expect("logs should be an array").len(), 0);
+    }
+
+    #[test]
+    fn pending_logs_bundle_subscription_kind_wire_name() {
+        let kind: BaseSubscriptionKind =
+            serde_json::from_str("\"pendingLogsBundle\"").expect("wire name should deserialize");
+        assert_eq!(kind, BaseSubscriptionKind::PendingLogsBundle);
+        assert_eq!(
+            serde_json::to_string(&BaseSubscriptionKind::PendingLogsBundle)
+                .expect("serialization should succeed"),
+            "\"pendingLogsBundle\""
+        );
+    }
+
+    #[test]
+    fn pending_logs_bundle_routes_to_the_base_variant() {
+        // `ExtendedSubscriptionKind` is untagged, so a name that also parses as a standard kind
+        // would be handed to reth's pubsub instead of this stream, and the subscription would
+        // silently deliver something else.
+        let kind: ExtendedSubscriptionKind =
+            serde_json::from_str("\"pendingLogsBundle\"").expect("wire name should deserialize");
+        assert_eq!(
+            kind,
+            ExtendedSubscriptionKind::Base(BaseSubscriptionKind::PendingLogsBundle),
+            "pendingLogsBundle must not be captured by the standard variant"
+        );
+        assert!(kind.as_standard().is_none());
+        assert!(kind.is_flashblocks());
     }
 }
