@@ -27,6 +27,9 @@ pub use metrics::Metrics;
 mod pending_blocks;
 pub use pending_blocks::{PendingBlocks, PendingBlocksBuilder};
 
+mod pending_state_provider;
+pub use pending_state_provider::{FlashblocksPendingSnapshot, FlashblocksPendingStateProvider};
+
 mod processor;
 pub use processor::{StateProcessor, StateUpdate};
 
@@ -57,5 +60,5 @@ pub use config::FlashblocksConfig;
 mod rpc;
 pub use rpc::{
     BaseSubscriptionKind, BlockNumberOrTagExt, EthApiExt, EthApiOverrideServer, EthPubSub,
-    EthPubSubApiServer, ExtendedSubscriptionKind, TransactionWithLogs,
+    EthPubSubApiServer, ExtendedSubscriptionKind, PendingLogsBundle, TransactionWithLogs,
 };

@@ -28,7 +28,7 @@ use tracing::error;
 
 use crate::{
     FlashblocksAPI, TransactionWithLogs,
-    rpc::types::{BaseSubscriptionKind, ExtendedSubscriptionKind},
+    rpc::types::{BaseSubscriptionKind, ExtendedSubscriptionKind, PendingLogsBundle},
 };
 
 /// Eth pub-sub RPC extension for flashblocks and standard subscriptions.
@@ -124,6 +124,43 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
                 },
             ),
             stream::iter,
+        )
+    }
+
+    /// Returns a stream that yields one message per flashblock, carrying every matching log from
+    /// that flashblock plus the pending block revision they came from.
+    ///
+    /// Unlike [`Self::pending_logs_stream`] this does not flatten and does not drop empty results.
+    /// The empty message is the point: it says a flashblock arrived and held nothing of interest,
+    /// which a consumer cannot otherwise distinguish from the stream having stalled.
+    fn pending_logs_bundle_stream(
+        flashblocks_state: Arc<FB>,
+        filter: Filter,
+    ) -> impl Stream<Item = PendingLogsBundle>
+    where
+        FB: FlashblocksAPI + Send + Sync + 'static,
+    {
+        StreamExt::filter_map(
+            BroadcastStream::new(flashblocks_state.subscribe_to_flashblocks()),
+            move |result| {
+                let pending_blocks = match result {
+                    Ok(blocks) => blocks,
+                    Err(err) => {
+                        error!(
+                            message = "Error in flashblocks stream for pending logs bundle",
+                            error = %err
+                        );
+                        return None;
+                    }
+                };
+                Some(PendingLogsBundle {
+                    block_number: pending_blocks.latest_block_number(),
+                    block_timestamp: pending_blocks.latest_header().timestamp,
+                    flashblock_index: pending_blocks.latest_flashblock_index(),
+                    pending_tx_count: pending_blocks.latest_block_transaction_count() as u64,
+                    logs: pending_blocks.get_latest_flashblock_logs(&filter),
+                })
+            },
         )
     }
 
@@ -272,6 +309,19 @@ where
                 };
 
                 let stream = Self::pending_logs_stream(Arc::clone(&self.flashblocks_state), filter);
+
+                tokio::spawn(async move {
+                    pipe_from_stream(sink, stream).await;
+                });
+            }
+            BaseSubscriptionKind::PendingLogsBundle => {
+                let filter = match params {
+                    Some(Params::Logs(filter)) => *filter,
+                    _ => Filter::default(),
+                };
+
+                let stream =
+                    Self::pending_logs_bundle_stream(Arc::clone(&self.flashblocks_state), filter);
 
                 tokio::spawn(async move {
                     pipe_from_stream(sink, stream).await;

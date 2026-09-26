@@ -84,8 +84,19 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> BaseEthApi<N, Rpc> {
             sequencer_client,
             min_suggested_priority_fee,
             base_time,
+            pending_state_source: std::sync::OnceLock::new(),
         });
         Self { inner }
+    }
+
+    /// Installs the source consulted by `local_pending_state`. Called once during node startup,
+    /// after the component that owns the pending state exists.
+    pub fn set_pending_state_source(&self, source: Arc<dyn crate::PendingStateSource>) {
+        let _ = self.inner.pending_state_source.set(source);
+    }
+
+    pub(crate) fn pending_state_source(&self) -> Option<&Arc<dyn crate::PendingStateSource>> {
+        self.inner.pending_state_source.get()
     }
 
     /// Build a [`BaseEthApi`] using [`BaseEthApiBuilder`].
@@ -291,6 +302,8 @@ pub struct BaseEthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     min_suggested_priority_fee: U256,
     /// Shared cache of validated `BaseTime` timestamps.
     base_time: BaseTimeCache,
+    /// Set once at startup by whichever component owns pending state; see `local_pending_state`.
+    pending_state_source: std::sync::OnceLock<Arc<dyn crate::PendingStateSource>>,
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for BaseEthApiInner<N, Rpc> {

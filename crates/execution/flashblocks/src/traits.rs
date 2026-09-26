@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, TxHash, U256};
-use alloy_rpc_types_eth::{Filter, Log, state::StateOverride};
+use alloy_rpc_types_eth::{Filter, Log};
 use arc_swap::Guard;
 use base_common_flashblocks::Flashblock;
 use base_common_network::Base;
@@ -27,6 +27,12 @@ pub trait FlashblocksAPI {
 
     /// Subscribes to flashblock updates.
     fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>>;
+
+    /// Number of the pending block currently published into reth's in-memory state.
+    ///
+    /// `None` means `BlockId::pending()` will not resolve to flashblock state, so callers must
+    /// fall back to simulating on the canonical block with flashblock state overrides.
+    fn native_pending_block_number(&self) -> Option<u64>;
 }
 
 /// API for accessing pending blocks data.
@@ -48,9 +54,6 @@ pub trait PendingBlocksAPI {
 
     /// Gets balance for an address. Returns None if address not updated in flashblocks.
     fn get_balance(&self, address: Address) -> Option<U256>;
-
-    /// Gets the state overrides for the pending blocks
-    fn get_state_overrides(&self) -> Option<StateOverride>;
 
     /// Gets logs from pending state matching the provided filter.
     fn get_pending_logs(&self, filter: &Filter) -> Vec<Log>;
