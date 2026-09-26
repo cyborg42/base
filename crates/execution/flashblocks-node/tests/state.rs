@@ -1,14 +1,14 @@
 //! Integration tests that stress Flashblocks state handling.
 
 use alloy_network::BlockResponse;
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use base_flashblocks::{FlashblocksAPI, PendingBlocksAPI};
 use base_flashblocks_node::test_harness::{FlashblockBuilder, FlashblocksBuilderTestHarness};
 use base_test_utils::Account;
 use reth_provider::{AccountReader, StateProviderFactory};
 
 #[tokio::test]
-async fn test_state_overrides_persisted_across_flashblocks() {
+async fn test_pending_state_persisted_across_flashblocks() {
     let test = FlashblocksBuilderTestHarness::new().await;
 
     test.send_flashblock(FlashblockBuilder::new_base(&test).build()).await;
@@ -22,15 +22,7 @@ async fn test_state_overrides_persisted_across_flashblocks() {
         1
     );
 
-    assert!(test.flashblocks.get_pending_blocks().get_state_overrides().is_some());
-    assert!(
-        !test
-            .flashblocks
-            .get_pending_blocks()
-            .get_state_overrides()
-            .unwrap()
-            .contains_key(&Account::Alice.address())
-    );
+    assert!(!pending_bundle_touched(&test, Account::Alice.address()));
 
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
@@ -48,43 +40,23 @@ async fn test_state_overrides_persisted_across_flashblocks() {
     let pending = pending.unwrap();
     assert_eq!(pending.transactions.len(), 2);
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 100_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 100_000))
     );
 
     test.send_flashblock(FlashblockBuilder::new(&test, 2).build()).await;
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution in flashblock index 1");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 100_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 100_000))
     );
 }
 
 #[tokio::test]
-async fn test_state_overrides_persisted_across_blocks() {
+async fn test_pending_state_persisted_across_blocks() {
     let test = FlashblocksBuilderTestHarness::new().await;
 
     let initial_base = FlashblockBuilder::new_base(&test).build();
@@ -100,15 +72,7 @@ async fn test_state_overrides_persisted_across_blocks() {
         1
     );
 
-    assert!(test.flashblocks.get_pending_blocks().get_state_overrides().is_some());
-    assert!(
-        !test
-            .flashblocks
-            .get_pending_blocks()
-            .get_state_overrides()
-            .unwrap()
-            .contains_key(&Account::Alice.address())
-    );
+    assert!(!pending_bundle_touched(&test, Account::Alice.address()));
 
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
@@ -126,20 +90,10 @@ async fn test_state_overrides_persisted_across_blocks() {
     let pending = pending.unwrap();
     assert_eq!(pending.transactions.len(), 2);
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 100_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 100_000))
     );
 
     test.send_flashblock(
@@ -168,14 +122,7 @@ async fn test_state_overrides_persisted_across_blocks() {
         initial_block_number + 1
     );
 
-    assert!(test.flashblocks.get_pending_blocks().get_state_overrides().is_some());
-    assert!(
-        test.flashblocks
-            .get_pending_blocks()
-            .get_state_overrides()
-            .unwrap()
-            .contains_key(&Account::Alice.address())
-    );
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
 
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
@@ -189,20 +136,10 @@ async fn test_state_overrides_persisted_across_blocks() {
     )
     .await;
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 200_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 200_000))
     );
 }
 
@@ -220,15 +157,7 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
             .len(),
         1
     );
-    assert!(test.flashblocks.get_pending_blocks().get_state_overrides().is_some());
-    assert!(
-        !test
-            .flashblocks
-            .get_pending_blocks()
-            .get_state_overrides()
-            .unwrap()
-            .contains_key(&Account::Alice.address())
-    );
+    assert!(!pending_bundle_touched(&test, Account::Alice.address()));
 
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
@@ -245,20 +174,10 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
     let pending = pending.unwrap();
     assert_eq!(pending.transactions.len(), 2);
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 100_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 100_000))
     );
 
     test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
@@ -279,20 +198,10 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
     let pending = pending.unwrap();
     assert_eq!(pending.transactions.len(), 2);
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 200_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 200_000))
     );
 
     test.new_canonical_block(vec![test.build_transaction_to_send_eth_with_nonce(
@@ -308,20 +217,10 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
     let pending = pending.unwrap();
     assert_eq!(pending.transactions.len(), 2);
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
+    assert!(pending_bundle_touched(&test, Account::Alice.address()));
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 100_000)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 100_000))
     );
 }
 
@@ -558,18 +457,11 @@ async fn test_eth_call_sees_flashblock_state_changes() {
     test.send_flashblock(FlashblockBuilder::new(&test, 1).with_transactions(vec![tx]).build())
         .await;
 
-    // Verify via state overrides that Bob received the funds
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("state overrides should exist after flashblock execution");
-    let bob_override = overrides.get(&bob_address).expect("Bob should have a state override");
-    let bob_pending_balance = bob_override.balance.expect("Bob's balance override should be set");
+    // Verify via the pending bundle that Bob received the funds
     assert_eq!(
-        bob_pending_balance,
-        canonical_balance + U256::from(transfer_to_bob),
-        "State override should show Bob's increased balance"
+        pending_bundle_balance(&test, bob_address),
+        Some(canonical_balance + U256::from(transfer_to_bob)),
+        "pending bundle should show Bob's increased balance"
     );
 
     // Now the key test: eth_call from Bob should see this pending balance.
@@ -636,18 +528,14 @@ async fn test_sequential_nonces_across_flashblocks() {
     );
 
     // Also verify Bob and Charlie received their funds
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("state overrides should exist");
-
-    assert!(
-        overrides.contains_key(&Account::Bob.address()),
+    assert_eq!(
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, 1000)),
         "Bob should have received funds from flashblock 1"
     );
-    assert!(
-        overrides.contains_key(&Account::Charlie.address()),
+    assert_eq!(
+        pending_bundle_balance(&test, Account::Charlie.address()),
+        Some(test.expected_pending_balance(Account::Charlie, 2000)),
         "Charlie should have received funds from flashblock 2"
     );
 }
@@ -709,22 +597,13 @@ async fn test_cached_flashblock_with_transactions_applied_after_canonical() {
     assert_eq!(pending.header.number, 2);
     assert_eq!(pending.transactions.len(), 2, "deposit tx from base + Alice->Bob transfer");
 
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("state overrides should exist after replayed flashblock execution");
     assert!(
-        overrides.contains_key(&Account::Alice.address()),
-        "Alice should appear in overrides after sending ETH"
+        pending_bundle_touched(&test, Account::Alice.address()),
+        "Alice should appear in the pending bundle after sending ETH"
     );
     assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("Bob should have state override")
-            .balance
-            .expect("balance should be overridden"),
-        test.expected_pending_balance(Account::Bob, transfer_amount)
+        pending_bundle_balance(&test, Account::Bob.address()),
+        Some(test.expected_pending_balance(Account::Bob, transfer_amount))
     );
 }
 
@@ -855,6 +734,21 @@ async fn test_same_block_append_refreshes_pending_header() {
 /// Advances the node past `pending`'s anchor without telling the state processor, reproducing
 /// the queue-lag shape from the 2026-08-20 mainnet incident where canonical and flashblock
 /// updates piled up in the shared unbounded queue while the node kept following the chain.
+/// Pending RPC resolves accounts through `FlashblocksPendingStateProvider`, which reads the
+/// snapshot's bundle before falling back to canonical state, so the bundle is what callers see.
+fn pending_bundle_touched(test: &FlashblocksBuilderTestHarness, address: Address) -> bool {
+    test.flashblocks
+        .get_pending_blocks()
+        .clone()
+        .is_some_and(|pending| pending.get_bundle_state().account(&address).is_some())
+}
+
+fn pending_bundle_balance(test: &FlashblocksBuilderTestHarness, address: Address) -> Option<U256> {
+    let pending = test.flashblocks.get_pending_blocks().clone()?;
+    let bundle = pending.get_bundle_state();
+    bundle.account(&address)?.info.as_ref().map(|info| info.balance)
+}
+
 async fn advance_tip_without_processing(test: &mut FlashblocksBuilderTestHarness, blocks: u64) {
     for _ in 0..blocks {
         test.new_canonical_block_without_processing(vec![]).await;
