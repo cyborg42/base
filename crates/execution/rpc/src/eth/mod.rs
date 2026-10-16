@@ -410,11 +410,11 @@ where
                 .with_mapper(BaseTxInfoMapper::new(provider, base_time.clone()));
 
         let sequencer_client = if let Some(url) = sequencer_url {
-            Some(
-                SequencerClient::new_with_headers(&url, sequencer_headers)
-                    .await
-                    .wrap_err_with(|| format!("Failed to init sequencer client with: {url}"))?,
-            )
+            let client = SequencerClient::new_with_headers(&url, sequencer_headers)
+                .await
+                .wrap_err_with(|| format!("Failed to init sequencer client with: {url}"))?;
+            client.spawn_keepalive(ctx.components.task_executor());
+            Some(client)
         } else {
             None
         };

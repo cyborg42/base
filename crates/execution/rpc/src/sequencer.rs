@@ -1,13 +1,19 @@
 //! Helpers for Base-specific RPC implementations.
 
-use std::{str::FromStr, sync::Arc, time::Instant};
+use std::{
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_json_rpc::{RpcRecv, RpcSend};
-use alloy_primitives::{B256, hex};
+use alloy_primitives::{B256, U64, hex};
 use alloy_rpc_client::{BuiltInConnectionString, ClientBuilder, RpcClient as Client};
 use alloy_transport_http::{Http, reqwest as alloy_reqwest};
+use reth_tasks::Runtime;
 use thiserror::Error;
-use tracing::warn;
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, trace, warn};
 
 use crate::{SequencerClientError, metrics::SequencerMetrics};
 
@@ -53,6 +59,16 @@ impl SequencerClientInner {
 }
 
 impl SequencerClient {
+    /// Interval between keepalive requests on an HTTP sequencer connection.
+    ///
+    /// Cloudflare in front of `mainnet-sequencer.base.org` closes idle keep-alive connections
+    /// after 400 s (measured 2026-10-16); a forward that finds no open connection pays DNS, TCP
+    /// and TLS first, about 15-20 ms on top of a warm round trip.
+    pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Upper bound on one keepalive request, so a hung request cannot stall the cadence.
+    pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Creates a new [`SequencerClient`] for the given URL.
     ///
     /// If the URL is a websocket endpoint we connect a websocket instance.
@@ -94,7 +110,10 @@ impl SequencerClient {
         ) {
             return Err(Error::InvalidScheme(sequencer_endpoint));
         }
-        let mut builder = alloy_reqwest::Client::builder().use_rustls_tls();
+        // reqwest evicts connections idle for 90 s by default, and forwards are often further
+        // apart than that, so most of them would reconnect. Server-side idle closes are handled
+        // by `spawn_keepalive`.
+        let mut builder = alloy_reqwest::Client::builder().use_rustls_tls().pool_idle_timeout(None);
         if !headers.is_empty() {
             let mut header_map = alloy_reqwest::header::HeaderMap::new();
             for header in headers {
@@ -160,6 +179,50 @@ impl SequencerClient {
                 },
             )?;
         Ok(resp)
+    }
+
+    /// Spawns a task that keeps the HTTP connection to the sequencer open.
+    ///
+    /// The task stops on node shutdown or once every handle to this client is dropped.
+    /// WebSocket endpoints already hold a persistent connection and are skipped.
+    pub fn spawn_keepalive(&self, executor: &Runtime) {
+        if !matches!(
+            BuiltInConnectionString::from_str(self.endpoint()),
+            Ok(BuiltInConnectionString::Http(_))
+        ) {
+            return;
+        }
+        let inner = Arc::downgrade(&self.inner);
+        executor.spawn_task(async move {
+            let mut ticker = tokio::time::interval(Self::KEEPALIVE_INTERVAL);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(inner) = inner.upgrade() else { break };
+                // The Base sequencer endpoint rejects eth_chainId at its proxy with a JSON-RPC
+                // error, so no mempool node sees it. The transport reads error bodies in full,
+                // which returns the connection to the pool either way.
+                let result = tokio::time::timeout(
+                    Self::KEEPALIVE_TIMEOUT,
+                    inner.client.request::<_, U64>("eth_chainId", ()),
+                )
+                .await;
+                match result {
+                    Ok(Ok(_)) => trace!(target: "rpc::sequencer", "sequencer keepalive answered"),
+                    Ok(Err(err)) if err.is_error_resp() => {
+                        trace!(target: "rpc::sequencer", %err, "sequencer keepalive answered")
+                    }
+                    Ok(Err(err)) => {
+                        SequencerMetrics::keepalive_failures().increment(1);
+                        debug!(target: "rpc::sequencer", %err, "sequencer keepalive failed");
+                    }
+                    Err(_) => {
+                        SequencerMetrics::keepalive_failures().increment(1);
+                        debug!(target: "rpc::sequencer", "sequencer keepalive timed out");
+                    }
+                }
+            }
+        });
     }
 
     /// Forwards a transaction to the sequencer endpoint.
