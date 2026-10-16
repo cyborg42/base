@@ -7,6 +7,8 @@ base_metrics::define_metrics! {
     struct = SequencerMetrics,
     #[describe("How long it takes to forward a transaction to the sequencer")]
     sequencer_forward_latency: histogram,
+    #[describe("Keepalive requests to the sequencer that got no response or timed out")]
+    keepalive_failures: counter,
 }
 
 impl SequencerMetrics {
