@@ -629,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn test_meter_bundle_ignores_flashblock_pending_state() -> eyre::Result<()> {
         let flashblocks_config =
-            FlashblocksConfig::new(Url::parse("ws://localhost:12345").unwrap(), 10);
+            FlashblocksConfig::new(vec![Url::parse("ws://localhost:12345").unwrap()], 10);
         let flashblocks_state = Arc::clone(&flashblocks_config.state);
 
         let harness = TestHarness::builder()

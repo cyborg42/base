@@ -402,7 +402,7 @@ impl InProcessClient {
             .map(|value| {
                 value
                     .parse::<Url>()
-                    .map(|url| FlashblocksConfig::new(url, 3))
+                    .map(|url| FlashblocksConfig::new(vec![url], 3))
                     .map_err(|e| eyre!("Failed to parse flashblocks URL: {}", e))
             })
             .transpose()?;

@@ -30,6 +30,13 @@ base_metrics::define_metrics! {
     pending_snapshot_height: gauge,
     #[describe("Total number of WebSocket reconnection attempts")]
     reconnect_attempts: counter,
+    #[describe("Flashblocks forwarded from each upstream connection because it delivered them first")]
+    #[label(upstream)]
+    upstream_first_arrivals: counter,
+    #[describe("Flashblocks dropped by the upstream merge because their position was already forwarded")]
+    upstream_duplicates: counter,
+    #[describe("Flashblocks dropped by the upstream merge because they skip the next expected flashblock")]
+    upstream_out_of_sequence: counter,
     #[describe("Count of times flashblocks get_transaction_count is called")]
     rpc_get_transaction_count: counter,
     #[describe("Count of times flashblocks get_transaction_receipt is called")]

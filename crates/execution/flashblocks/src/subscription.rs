@@ -1,28 +1,35 @@
 //! WebSocket subscription handling for flashblocks.
 
-use std::{sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use base_common_flashblocks::Flashblock;
 use futures::{SinkExt as _, StreamExt};
 use tokio::{
+    net::TcpStream,
     sync::mpsc,
     time::{Instant, interval_at},
 };
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
+    tungstenite::{Error as WsError, error::UrlError, protocol::Message},
+};
 use url::Url;
 
-use crate::{FlashblocksReceiver, metrics::Metrics};
+use crate::{FlashblockSequenceGate, FlashblocksReceiver, SequenceGateDecision, metrics::Metrics};
 
 #[derive(Debug)]
 enum ActorMessage {
-    BestPayload { payload: Flashblock },
+    BestPayload { upstream: usize, payload: Flashblock },
 }
 
 /// Subscribes to flashblocks via WebSocket and forwards them to the receiver.
+///
+/// With several upstream URLs, one connection per URL feeds a [`FlashblockSequenceGate`] that
+/// passes on each flashblock from whichever connection delivers it first.
 #[derive(Debug)]
 pub struct FlashblocksSubscriber<Receiver> {
     flashblocks_state: Arc<Receiver>,
-    ws_url: Url,
+    ws_urls: Vec<Url>,
     ping_interval: Duration,
 }
 
@@ -36,32 +43,77 @@ where
     /// Creates a new flashblocks subscriber.
     pub const fn new(
         flashblocks_state: Arc<Receiver>,
-        ws_url: Url,
+        ws_urls: Vec<Url>,
         ping_interval: Duration,
     ) -> Self {
-        Self { ws_url, flashblocks_state, ping_interval }
+        Self { ws_urls, flashblocks_state, ping_interval }
     }
 
     /// Starts the WebSocket subscription to receive flashblocks.
     pub fn start(&mut self) {
-        info!(
-            message = "Starting Flashblocks subscription",
-            url = %self.ws_url,
-        );
-
-        let ws_url = self.ws_url.clone();
-        let ping_period = self.ping_interval;
-
         let (sender, mut mailbox) = mpsc::channel(100);
+        let upstreams = self.ws_urls.len();
+        for (upstream, ws_url) in self.ws_urls.iter().enumerate() {
+            info!(
+                message = "Starting Flashblocks subscription",
+                url = %ws_url,
+                upstream,
+            );
+            Self::spawn_upstream(
+                upstream,
+                upstreams,
+                ws_url.clone(),
+                self.ping_interval,
+                sender.clone(),
+            );
+        }
 
+        let flashblocks_state = Arc::clone(&self.flashblocks_state);
+        tokio::spawn(async move {
+            // A single upstream is already in order; the gate would only change how gaps
+            // reach the processor.
+            let mut gate = (upstreams > 1).then(FlashblockSequenceGate::default);
+            while let Some(message) = mailbox.recv().await {
+                match message {
+                    ActorMessage::BestPayload { upstream, payload } => {
+                        if let Some(gate) = gate.as_mut() {
+                            match gate.admit(&payload) {
+                                SequenceGateDecision::Forward => {
+                                    Metrics::upstream_first_arrivals(upstream.to_string())
+                                        .increment(1);
+                                }
+                                SequenceGateDecision::Duplicate => {
+                                    Metrics::upstream_duplicates().increment(1);
+                                    continue;
+                                }
+                                SequenceGateDecision::OutOfSequence => {
+                                    Metrics::upstream_out_of_sequence().increment(1);
+                                    continue;
+                                }
+                            }
+                        }
+                        flashblocks_state.on_flashblock_received(payload);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Spawns the connection task for one upstream, which reconnects with backoff forever.
+    fn spawn_upstream(
+        upstream: usize,
+        upstreams: usize,
+        ws_url: Url,
+        ping_period: Duration,
+        sender: mpsc::Sender<ActorMessage>,
+    ) {
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
 
             loop {
-                match connect_async(ws_url.as_str()).await {
-                    Ok((ws_stream, _)) => {
+                match Self::connect(upstream, upstreams, &ws_url).await {
+                    Ok(ws_stream) => {
                         backoff = Duration::from_secs(1);
-                        info!(message = "WebSocket connection established");
 
                         let mut ping_interval =
                             interval_at(Instant::now() + ping_period, ping_period);
@@ -79,7 +131,7 @@ where
                                             let bytes = msg.into_data();
                                             match Flashblock::try_decode_message(bytes) {
                                                 Ok(payload) => {
-                                                    let _ = sender.send(ActorMessage::BestPayload { payload }).await.map_err(|e| {
+                                                    let _ = sender.send(ActorMessage::BestPayload { upstream, payload }).await.map_err(|e| {
                                                         error!(message = "Failed to publish message to channel", error = %e);
                                                     });
                                                 }
@@ -159,17 +211,65 @@ where
                 }
             }
         });
+    }
 
-        let flashblocks_state = Arc::clone(&self.flashblocks_state);
-        tokio::spawn(async move {
-            while let Some(message) = mailbox.recv().await {
-                match message {
-                    ActorMessage::BestPayload { payload } => {
-                        flashblocks_state.on_flashblock_received(payload);
-                    }
+    /// Opens the WebSocket connection for one upstream.
+    ///
+    /// A single upstream connects exactly as before. With several, the host is resolved on every
+    /// attempt and upstream `i` starts at resolved address `i mod n`: a plain connect keeps the
+    /// first address that answers, which would put every connection on the same edge address,
+    /// while the late-delivery independence that motivates several connections was measured
+    /// across distinct addresses. TLS SNI and the Host header still come from the URL.
+    async fn connect(
+        upstream: usize,
+        upstreams: usize,
+        ws_url: &Url,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WsError> {
+        if upstreams == 1 {
+            let (ws_stream, _) = connect_async(ws_url.as_str()).await?;
+            info!(message = "WebSocket connection established");
+            return Ok(ws_stream);
+        }
+
+        let host = ws_url
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .ok_or(WsError::Url(UrlError::NoHostName))?;
+        let port =
+            ws_url.port_or_known_default().ok_or(WsError::Url(UrlError::UnsupportedUrlScheme))?;
+        let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+
+        let mut last_error =
+            io::Error::new(io::ErrorKind::NotFound, "upstream host resolved to no addresses");
+        let start = upstream % addrs.len().max(1);
+        for addr in addrs.iter().cycle().skip(start).take(addrs.len()) {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    let (ws_stream, _) =
+                        client_async_tls_with_config(ws_url.as_str(), stream, None, None).await?;
+                    info!(
+                        message = "WebSocket connection established",
+                        upstream,
+                        url = %ws_url,
+                        peer = %addr,
+                    );
+                    return Ok(ws_stream);
+                }
+                Err(error) => {
+                    warn!(
+                        target: "flashblocks_rpc::subscription",
+                        upstream,
+                        peer = %addr,
+                        %error,
+                        "Upstream address unreachable, trying the next one",
+                    );
+                    last_error = error;
                 }
             }
-        });
+        }
+        Err(WsError::Io(last_error))
     }
 
     /// Sleeps for given backoff duration. Returns incremented backoff duration, capped at [`MAX_BACKOFF`].

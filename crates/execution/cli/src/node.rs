@@ -409,8 +409,8 @@ mod tests {
 
         assert_eq!(args.node.network.port, 30333);
         assert_eq!(
-            args.standard.flashblocks_url.as_ref().map(Url::as_str),
-            Some("wss://example.com/ws")
+            args.standard.flashblocks_url.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["wss://example.com/ws"]
         );
         assert!(!args.metering.enable_metering);
     }

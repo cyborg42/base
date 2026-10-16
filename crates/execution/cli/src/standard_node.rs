@@ -291,8 +291,12 @@ pub struct RpcStandardNodeArgs {
     ///
     /// If given, the flashblocks are received to build pending block. All request with "pending"
     /// block tag will use the pending state based on flashblocks.
-    #[arg(long, alias = "websocket-url")]
-    pub flashblocks_url: Option<Url>,
+    ///
+    /// A comma-separated list opens one connection per entry and passes on whichever delivers
+    /// each flashblock first. Repeating the same URL is allowed: the connections then spread over
+    /// the addresses the host resolves to.
+    #[arg(long, alias = "websocket-url", value_delimiter = ',')]
+    pub flashblocks_url: Vec<Url>,
 
     /// The max pending blocks depth.
     #[arg(
@@ -507,9 +511,12 @@ impl HasRollupArgs for StandardNodeArgs {
 
 impl From<&StandardNodeArgs> for Option<FlashblocksConfig> {
     fn from(args: &StandardNodeArgs) -> Self {
-        args.rpc.flashblocks_url.clone().map(|url| {
-            FlashblocksConfig::new(url, args.rpc.max_pending_blocks_depth)
-                .with_subscriber_ping_interval(args.rpc.flashblocks_ping_interval)
+        (!args.rpc.flashblocks_url.is_empty()).then(|| {
+            FlashblocksConfig::new(
+                args.rpc.flashblocks_url.clone(),
+                args.rpc.max_pending_blocks_depth,
+            )
+            .with_subscriber_ping_interval(args.rpc.flashblocks_ping_interval)
         })
     }
 }
@@ -937,7 +944,7 @@ mod tests {
         RpcStandardNodeArgs {
             rollup_args: RollupArgs::default(),
             rpc_forwarding_endpoint: None,
-            flashblocks_url: None,
+            flashblocks_url: Vec::new(),
             max_pending_blocks_depth: 3,
             flashblocks_ping_interval: Duration::from_secs(30),
             enable_transaction_tracing: false,
@@ -979,7 +986,7 @@ mod tests {
             .expect("default args should parse without flashblocks enabled")
             .args;
 
-        assert_eq!(args.flashblocks_url, None);
+        assert!(args.flashblocks_url.is_empty());
         assert_eq!(args.flashblocks_ping_interval, Duration::from_secs(30));
     }
 

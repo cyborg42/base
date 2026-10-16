@@ -39,6 +39,9 @@ pub use state::FlashblocksState;
 mod subscription;
 pub use subscription::FlashblocksSubscriber;
 
+mod sequence_gate;
+pub use sequence_gate::{FlashblockSequenceGate, SequenceGateDecision, SequenceGatePosition};
+
 mod traits;
 pub use traits::{FlashblocksAPI, FlashblocksReceiver, PendingBlocksAPI};
 
